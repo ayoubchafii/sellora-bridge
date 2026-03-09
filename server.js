@@ -7,12 +7,10 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WA_TOKEN = process.env.WA_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VF_API_KEY = process.env.VF_API_KEY;
-const VF_VERSION = "development";
+const VF_PROJECT_ID = process.env.VF_PROJECT_ID;
 
-// Track which users have already launched
 const launchedUsers = new Set();
 
-// ── Voiceflow interact helper
 async function vfInteract(userPhone, action) {
   const response = await axios.post(
     `https://general-runtime.voiceflow.com/state/user/${userPhone}/interact`,
@@ -23,7 +21,8 @@ async function vfInteract(userPhone, action) {
     {
       headers: {
         Authorization: VF_API_KEY,
-        versionID: VF_VERSION,
+        versionID: "development",
+        projectID: VF_PROJECT_ID,
         "Content-Type": "application/json"
       }
     }
@@ -31,14 +30,12 @@ async function vfInteract(userPhone, action) {
   return response.data;
 }
 
-// ── Extract text messages from Voiceflow response
 function extractReplies(data) {
   return data
     .filter(t => t.type === "text" && t.payload?.message)
     .map(t => t.payload.message);
 }
 
-// ── Send WhatsApp message
 async function sendWhatsApp(to, text) {
   await axios.post(
     `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
@@ -57,7 +54,6 @@ async function sendWhatsApp(to, text) {
   );
 }
 
-// ── STEP 1: Meta webhook verification (GET)
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -70,7 +66,6 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-// ── STEP 2: Receive WhatsApp message (POST)
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 
@@ -86,25 +81,26 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`Incoming from ${userPhone}: ${userText}`);
 
-    // If new user, send launch first to initialize the conversation
     if (!launchedUsers.has(userPhone)) {
       console.log(`New user ${userPhone} - sending launch event`);
-      const launchData = await vfInteract(userPhone, { type: "launch" });
-      const launchReplies = extractReplies(launchData);
-      launchedUsers.add(userPhone);
-
-      if (launchReplies.length > 0) {
-        await sendWhatsApp(userPhone, launchReplies.join("\n\n"));
-        console.log(`Sent launch reply to ${userPhone}`);
+      try {
+        const launchData = await vfInteract(userPhone, { type: "launch" });
+        const launchReplies = extractReplies(launchData);
+        launchedUsers.add(userPhone);
+        if (launchReplies.length > 0) {
+          await sendWhatsApp(userPhone, launchReplies.join("\n\n"));
+          console.log(`Sent launch reply to ${userPhone}`);
+        }
+      } catch (launchErr) {
+        console.error("Launch error:", launchErr.response?.data || launchErr.message);
       }
     }
 
-    // Send the actual text message
     const textData = await vfInteract(userPhone, { type: "text", payload: userText });
     const replies = extractReplies(textData);
 
     if (replies.length === 0) {
-      console.log(`No text replies from Voiceflow for ${userPhone}`);
+      console.log(`No replies from Voiceflow`);
       return;
     }
 
