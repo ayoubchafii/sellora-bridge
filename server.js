@@ -7,19 +7,22 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WA_TOKEN = process.env.WA_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VF_API_KEY = process.env.VF_API_KEY;
-const VF_PROJECT_ID = process.env.VF_PROJECT_ID;
 
-async function vfInteract(sessionID, request) {
+// Note: V1 API relies on the API Key to identify the project, not the Project ID in the URL.
+async function vfInteract(sessionID, userText) {
   const response = await axios.post(
-    `https://general-runtime.voiceflow.com/v2beta1/predict/${VF_PROJECT_ID}`,
+    `https://general-runtime.voiceflow.com/state/user/${sessionID}/interact`,
     {
-      session: { sessionID },
-      request
+      action: {
+        type: "text",
+        payload: userText
+      }
     },
     {
       headers: {
         Authorization: VF_API_KEY,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        versionID: "production"
       }
     }
   );
@@ -70,7 +73,7 @@ app.get("/webhook", (req, res) => {
 });
 
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // Acknowledge Meta immediately to prevent timeout retries
 
   try {
     const entry = req.body?.entry?.[0];
@@ -84,9 +87,11 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`Incoming from ${userPhone}: ${userText}`);
 
-    const data = await vfInteract(userPhone, { type: "text", payload: userText });
+    // Call Voiceflow V1 API
+    const data = await vfInteract(userPhone, userText);
     console.log("VF raw response:", JSON.stringify(data));
 
+    // Parse response
     const replies = extractReplies(data);
 
     if (replies.length === 0) {
@@ -94,6 +99,7 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
+    // Send back to WhatsApp
     await sendWhatsApp(userPhone, replies.join("\n\n"));
     console.log(`Replied: ${replies.join(" | ")}`);
 
