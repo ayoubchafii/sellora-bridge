@@ -7,13 +7,15 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WA_TOKEN = process.env.WA_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VF_API_KEY = process.env.VF_API_KEY;
-const VF_PROJECT_ID = process.env.VF_PROJECT_ID;
+
+// Your canvas/version ID from the Voiceflow URL
+const VF_VERSION_ID = "64dbb6696a8fab0013dba194";
 
 const launchedUsers = new Set();
 
 async function vfInteract(userPhone, action) {
   const response = await axios.post(
-    `https://general-runtime.voiceflow.com/v2/project/${VF_PROJECT_ID}/user/${userPhone}/interact`,
+    `https://general-runtime.voiceflow.com/state/user/${userPhone}/interact`,
     {
       action,
       config: { tts: false, stripSSML: true }
@@ -21,6 +23,7 @@ async function vfInteract(userPhone, action) {
     {
       headers: {
         Authorization: VF_API_KEY,
+        versionID: VF_VERSION_ID,
         "Content-Type": "application/json"
       }
     }
