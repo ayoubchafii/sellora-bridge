@@ -7,23 +7,18 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WA_TOKEN = process.env.WA_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VF_API_KEY = process.env.VF_API_KEY;
+const VF_PROJECT_ID = process.env.VF_PROJECT_ID;
 
-// Your canvas/version ID from the Voiceflow URL
-const VF_VERSION_ID = "64dbb6696a8fab0013dba194";
-
-const launchedUsers = new Set();
-
-async function vfInteract(userPhone, action) {
+async function vfInteract(sessionID, request) {
   const response = await axios.post(
-    `https://general-runtime.voiceflow.com/state/user/${userPhone}/interact`,
+    `https://general-runtime.voiceflow.com/v2beta1/predict/${VF_PROJECT_ID}`,
     {
-      action,
-      config: { tts: false, stripSSML: true }
+      session: { sessionID },
+      request
     },
     {
       headers: {
         Authorization: VF_API_KEY,
-        versionID: VF_VERSION_ID,
         "Content-Type": "application/json"
       }
     }
@@ -33,9 +28,15 @@ async function vfInteract(userPhone, action) {
 
 function extractReplies(data) {
   if (!Array.isArray(data)) return [];
-  return data
-    .filter(t => t.type === "text" && t.payload?.message)
-    .map(t => t.payload.message);
+  const replies = [];
+  for (const trace of data) {
+    if (trace.type === "text" && trace.payload?.message) {
+      replies.push(trace.payload.message);
+    } else if (trace.type === "speak" && trace.payload?.message) {
+      replies.push(trace.payload.message);
+    }
+  }
+  return replies;
 }
 
 async function sendWhatsApp(to, text) {
@@ -83,27 +84,13 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`Incoming from ${userPhone}: ${userText}`);
 
-    if (!launchedUsers.has(userPhone)) {
-      console.log(`New user - launching`);
-      try {
-        const launchData = await vfInteract(userPhone, { type: "launch" });
-        const launchReplies = extractReplies(launchData);
-        launchedUsers.add(userPhone);
-        if (launchReplies.length > 0) {
-          await sendWhatsApp(userPhone, launchReplies.join("\n\n"));
-          console.log(`Launch reply sent`);
-        }
-      } catch (e) {
-        console.error("Launch error:", JSON.stringify(e.response?.data) || e.message);
-      }
-    }
+    const data = await vfInteract(userPhone, { type: "text", payload: userText });
+    console.log("VF raw response:", JSON.stringify(data));
 
-    const textData = await vfInteract(userPhone, { type: "text", payload: userText });
-    console.log("VF response:", JSON.stringify(textData));
-    const replies = extractReplies(textData);
+    const replies = extractReplies(data);
 
     if (replies.length === 0) {
-      console.log("No replies from VF");
+      console.log("No replies extracted from VF response");
       return;
     }
 
