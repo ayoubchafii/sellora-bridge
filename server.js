@@ -13,7 +13,7 @@ const launchedUsers = new Set();
 
 async function vfInteract(userPhone, action) {
   const response = await axios.post(
-    `https://general-runtime.voiceflow.com/state/user/${userPhone}/interact`,
+    `https://general-runtime.voiceflow.com/v2/project/${VF_PROJECT_ID}/user/${userPhone}/interact`,
     {
       action,
       config: { tts: false, stripSSML: true }
@@ -21,8 +21,6 @@ async function vfInteract(userPhone, action) {
     {
       headers: {
         Authorization: VF_API_KEY,
-        versionID: "development",
-        projectID: VF_PROJECT_ID,
         "Content-Type": "application/json"
       }
     }
@@ -31,6 +29,7 @@ async function vfInteract(userPhone, action) {
 }
 
 function extractReplies(data) {
+  if (!Array.isArray(data)) return [];
   return data
     .filter(t => t.type === "text" && t.payload?.message)
     .map(t => t.payload.message);
@@ -82,34 +81,34 @@ app.post("/webhook", async (req, res) => {
     console.log(`Incoming from ${userPhone}: ${userText}`);
 
     if (!launchedUsers.has(userPhone)) {
-      console.log(`New user ${userPhone} - sending launch event`);
+      console.log(`New user - launching`);
       try {
         const launchData = await vfInteract(userPhone, { type: "launch" });
         const launchReplies = extractReplies(launchData);
         launchedUsers.add(userPhone);
         if (launchReplies.length > 0) {
           await sendWhatsApp(userPhone, launchReplies.join("\n\n"));
-          console.log(`Sent launch reply to ${userPhone}`);
+          console.log(`Launch reply sent`);
         }
-      } catch (launchErr) {
-        console.error("Launch error:", launchErr.response?.data || launchErr.message);
+      } catch (e) {
+        console.error("Launch error:", JSON.stringify(e.response?.data) || e.message);
       }
     }
 
     const textData = await vfInteract(userPhone, { type: "text", payload: userText });
+    console.log("VF response:", JSON.stringify(textData));
     const replies = extractReplies(textData);
 
     if (replies.length === 0) {
-      console.log(`No replies from Voiceflow`);
+      console.log("No replies from VF");
       return;
     }
 
-    const botReply = replies.join("\n\n");
-    await sendWhatsApp(userPhone, botReply);
-    console.log(`Replied to ${userPhone}: ${botReply}`);
+    await sendWhatsApp(userPhone, replies.join("\n\n"));
+    console.log(`Replied: ${replies.join(" | ")}`);
 
   } catch (err) {
-    console.error("Error:", err.response?.data || err.message);
+    console.error("Error:", JSON.stringify(err.response?.data) || err.message);
   }
 });
 
