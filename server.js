@@ -8,7 +8,7 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;         // sellora123
 const WA_TOKEN = process.env.WA_TOKEN;                 // Meta access token
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;   // 967413439796424
 const VF_API_KEY = process.env.VF_API_KEY;             // Voiceflow API key
-const VF_VERSION = "production";
+const VF_VERSION = "development";
 
 // ── STEP 1: Meta webhook verification (GET)
 app.get("/webhook", (req, res) => {
