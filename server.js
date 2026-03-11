@@ -7,106 +7,111 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WA_TOKEN = process.env.WA_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VF_API_KEY = process.env.VF_API_KEY;
+const VF_PROJECT_ID = process.env.VF_PROJECT_ID;
+const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
 
-// Note: V1 API relies on the API Key to identify the project, not the Project ID in the URL.
-async function vfInteract(sessionID, userText) {
-  const response = await axios.post(
-    `https://general-runtime.voiceflow.com/state/user/${sessionID}/interact`,
-    {
-      action: {
-        type: "text",
-        payload: userText
-      }
-    },
-    {
-      headers: {
-        Authorization: VF_API_KEY,
-        "Content-Type": "application/json",
-        versionID: "production"
-      }
-    }
-  );
-  return response.data;
-}
-
-function extractReplies(data) {
-  if (!Array.isArray(data)) return [];
-  const replies = [];
-  for (const trace of data) {
-    if (trace.type === "text" && trace.payload?.message) {
-      replies.push(trace.payload.message);
-    } else if (trace.type === "speak" && trace.payload?.message) {
-      replies.push(trace.payload.message);
-    }
-  }
-  return replies;
-}
-
-async function sendWhatsApp(to, text) {
-  await axios.post(
-    `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
-    {
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: text }
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${WA_TOKEN}`,
-        "Content-Type": "application/json"
-      }
-    }
-  );
-}
-
+// Webhook verification
 app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("Webhook verified");
-    res.status(200).send(challenge);
+  if (
+    req.query["hub.mode"] === "subscribe" &&
+    req.query["hub.verify_token"] === VERIFY_TOKEN
+  ) {
+    res.status(200).send(req.query["hub.challenge"]);
   } else {
     res.sendStatus(403);
   }
 });
 
+// Incoming WhatsApp messages
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200); // Acknowledge Meta immediately to prevent timeout retries
+  res.sendStatus(200);
 
   try {
-    const entry = req.body?.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const message = changes?.value?.messages?.[0];
+    const entry = req.body.entry?.[0];
+    const change = entry?.changes?.[0];
+    const message = change?.value?.messages?.[0];
 
     if (!message || message.type !== "text") return;
 
     const userPhone = message.from;
     const userText = message.text.body;
 
-    console.log(`Incoming from ${userPhone}: ${userText}`);
+    // Send to Voiceflow
+    const vfResponse = await axios.post(
+      `https://general-runtime.voiceflow.com/state/user/${userPhone}/interact`,
+      {
+        action: { type: "text", payload: userText },
+        config: { tts: false, stripSSML: true }
+      },
+      {
+        headers: {
+          Authorization: VF_API_KEY,
+          "Content-Type": "application/json",
+          versionID: "production"
+        }
+      }
+    );
 
-    // Call Voiceflow V1 API
-    const data = await vfInteract(userPhone, userText);
-    console.log("VF raw response:", JSON.stringify(data));
+    // Extract text replies from Voiceflow
+    const traces = vfResponse.data;
+    let fullReply = "";
 
-    // Parse response
-    const replies = extractReplies(data);
-
-    if (replies.length === 0) {
-      console.log("No replies extracted from VF response");
-      return;
+    for (const trace of traces) {
+      if (trace.type === "text" && trace.payload?.message) {
+        fullReply += trace.payload.message + "\n";
+      }
     }
 
-    // Send back to WhatsApp
-    await sendWhatsApp(userPhone, replies.join("\n\n"));
-    console.log(`Replied: ${replies.join(" | ")}`);
+    if (!fullReply.trim()) return;
+
+    // Detect hidden booking tag
+    const bookingTagRegex = /\[BOOKING:([^\]]+)\]/;
+    const match = fullReply.match(bookingTagRegex);
+
+    if (match && MAKE_WEBHOOK_URL) {
+      // Parse booking data from tag
+      const tagContent = match[1];
+      const bookingData = {};
+      tagContent.split(",").forEach(pair => {
+        const [key, ...rest] = pair.split("=");
+        bookingData[key.trim()] = rest.join("=").trim();
+      });
+
+      // Fire Make.com webhook in background
+      axios.post(MAKE_WEBHOOK_URL, {
+        name: bookingData.name || "",
+        phone: bookingData.phone || userPhone,
+        requested_time: bookingData.time || "",
+        service: bookingData.service || "",
+        patient_phone: userPhone,
+        clinic_owner_phone: process.env.CLINIC_OWNER_PHONE || userPhone
+      }).catch(err => console.error("Make.com webhook error:", err.message));
+
+      // Strip the hidden tag from the visible reply
+      fullReply = fullReply.replace(bookingTagRegex, "").trim();
+    }
+
+    // Send clean reply to WhatsApp
+    await axios.post(
+      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to: userPhone,
+        type: "text",
+        text: { body: fullReply.trim() }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${WA_TOKEN}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
 
   } catch (err) {
-    console.error("Error:", JSON.stringify(err.response?.data) || err.message);
+    console.error("Error:", err.response?.data || err.message);
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Bridge running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
