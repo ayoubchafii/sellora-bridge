@@ -14,7 +14,7 @@ const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const AWS_REGION = process.env.AWS_REGION || "us-east-1";
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
 
-const MODEL_ID = "anthropic.claude-sonnet-4-6";
+const MODEL_ID = "us.anthropic.claude-sonnet-4-6-20250514-v1:0";
 
 // ── AWS Bedrock client
 const bedrockClient = new BedrockRuntimeClient({
