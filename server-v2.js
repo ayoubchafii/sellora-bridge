@@ -15,6 +15,7 @@ const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const AWS_REGION = process.env.AWS_REGION || "us-east-1";
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
 const CANCEL_WEBHOOK_URL = process.env.CANCEL_WEBHOOK_URL;
+const CLINIC_OWNER_PHONE = process.env.CLINIC_OWNER_PHONE || "";
 
 const MODEL_ID = "global.anthropic.claude-sonnet-4-6";
 
@@ -126,6 +127,33 @@ async function sendWhatsApp(to, message) {
   );
 }
 
+// ── Send clinic owner notification
+async function notifyClinicOwner(type, details) {
+  if (!CLINIC_OWNER_PHONE) {
+    console.log("No CLINIC_OWNER_PHONE set, skipping notification");
+    return;
+  }
+
+  let message = "";
+
+  if (type === "new_booking") {
+    message = `موعد جديد:\nالاسم: ${details.name}\nالهاتف: ${details.phone}\nالخدمة: ${details.service}\nالوقت: ${details.time}`;
+  } else if (type === "cancelled") {
+    message = `تم إلغاء موعد:\nالاسم: ${details.name}\nالهاتف: ${details.phone}`;
+  } else if (type === "rescheduled") {
+    message = `تم تغيير موعد:\nالاسم: ${details.name}\nالهاتف: ${details.phone}\nالخدمة: ${details.service}\nمن: ${details.old_time}\nإلى: ${details.new_time}`;
+  }
+
+  if (!message) return;
+
+  try {
+    await sendWhatsApp(CLINIC_OWNER_PHONE, message);
+    console.log(`Clinic owner notified: ${type}`);
+  } catch (err) {
+    console.error("Clinic notification error:", err.message);
+  }
+}
+
 // ── Call Make.com BOOKING webhook and WAIT for JSON response
 async function triggerBooking(bookingParams, patientPhone) {
   if (!MAKE_WEBHOOK_URL) {
@@ -139,7 +167,7 @@ async function triggerBooking(bookingParams, patientPhone) {
     requested_time: bookingParams.time || "",
     service: bookingParams.service || "free consultation",
     patient_phone: patientPhone,
-    clinic_owner_phone: process.env.CLINIC_OWNER_PHONE || "",
+    clinic_owner_phone: CLINIC_OWNER_PHONE,
   };
 
   console.log("Triggering BOOKING webhook:", payload);
@@ -230,16 +258,15 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
     console.log("RESCHEDULE complete: new time booked successfully.");
     return {
       status: "rescheduled",
-      time: rescheduleParams.new_time,
+      old_time: oldTime,
+      new_time: rescheduleParams.new_time,
       service: rescheduleParams.service || oldService,
     };
   }
 
-  // Step 3: New time failed — re-book the old time to restore it
+  // Step 3: New time failed — re-book the old time to restore it (SILENT — no notification)
   console.log(`RESCHEDULE Step 3: New time failed (${bookResult.status}). Re-booking old time...`);
 
-  // Extract the old event name to get original patient name format
-  // old_service from cancel response is actually the event Summary like "سعد—تبييض الأسنان"
   const rebookParams = {
     name: rescheduleParams.name || "",
     phone: rescheduleParams.phone || patientPhone,
@@ -250,11 +277,11 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
   console.log(`Re-book old time result: ${rebookResult.status}`);
 
   if (bookResult.status === "busy") {
-    return { status: "reschedule_failed_busy" };
+    return { status: "reschedule_failed_busy", rebookSilent: true };
   }
 
   if (bookResult.status === "outside_hours") {
-    return { status: "reschedule_failed_outside_hours" };
+    return { status: "reschedule_failed_outside_hours", rebookSilent: true };
   }
 
   return { status: "error" };
@@ -339,6 +366,16 @@ app.post("/webhook", async (req, res) => {
       await sendWhatsApp(userPhone, cleanFinal);
       console.log(`Replied to ${userPhone}: ${cleanFinal}`);
 
+      // Notify clinic owner for successful bookings only
+      if (makeResult.status === "booked") {
+        await notifyClinicOwner("new_booking", {
+          name: bookingParams.name,
+          phone: bookingParams.phone || userPhone,
+          service: bookingParams.service || "free consultation",
+          time: bookingParams.time,
+        });
+      }
+
     } else if (cancelParams) {
       // ── CANCEL FLOW
       console.log("Cancel detected:", cancelParams);
@@ -353,6 +390,14 @@ app.post("/webhook", async (req, res) => {
       await sendWhatsApp(userPhone, cleanFinal);
       console.log(`Replied to ${userPhone}: ${cleanFinal}`);
 
+      // Notify clinic owner for successful cancellations only
+      if (cancelResult.status === "cancelled") {
+        await notifyClinicOwner("cancelled", {
+          name: cancelParams.name,
+          phone: cancelParams.phone || userPhone,
+        });
+      }
+
     } else if (rescheduleParams) {
       // ── RESCHEDULE FLOW
       console.log("Reschedule detected:", rescheduleParams);
@@ -366,6 +411,18 @@ app.post("/webhook", async (req, res) => {
 
       await sendWhatsApp(userPhone, cleanFinal);
       console.log(`Replied to ${userPhone}: ${cleanFinal}`);
+
+      // Notify clinic owner for successful reschedules only — NOT for failed re-books
+      if (rescheduleResult.status === "rescheduled") {
+        await notifyClinicOwner("rescheduled", {
+          name: rescheduleParams.name,
+          phone: rescheduleParams.phone || userPhone,
+          service: rescheduleParams.service || rescheduleResult.service,
+          old_time: rescheduleResult.old_time,
+          new_time: rescheduleParams.new_time,
+        });
+      }
+      // Failed reschedule (re-book) → NO notification. Nothing changed for the clinic.
 
     } else {
       // ── NORMAL FLOW: no tags, send response directly
