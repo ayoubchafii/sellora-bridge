@@ -51,6 +51,35 @@ function addToHistory(phone, role, content) {
   }
 }
 
+// ── Convert UTC datetime string to readable Arabic (Gulf time UTC+3)
+function formatTimeArabic(isoString) {
+  try {
+    // Handle various formats from Google Calendar
+    const cleaned = String(isoString).trim();
+    const date = new Date(cleaned);
+
+    if (isNaN(date.getTime())) {
+      // If parsing fails, return the original string
+      return isoString;
+    }
+
+    // Convert UTC to Gulf time (UTC+3)
+    const gulfDate = new Date(date.getTime() + 3 * 60 * 60 * 1000);
+
+    const days = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
+    const dayName = days[gulfDate.getUTCDay()];
+
+    let hours = gulfDate.getUTCHours();
+    const period = hours >= 12 ? "مساءً" : "صباحاً";
+    if (hours > 12) hours -= 12;
+    if (hours === 0) hours = 12;
+
+    return `${dayName} الساعة ${hours} ${period}`;
+  } catch (err) {
+    return isoString;
+  }
+}
+
 // ── Parse [BOOKING:...] tag from Sara's response
 function extractBookingTag(text) {
   const match = text.match(/\[BOOKING:([^\]]+)\]/);
@@ -239,9 +268,10 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
   }
 
   // Save old event details for potential re-booking
-  const oldTime = cancelResult.old_time || "";
+  const oldTimeRaw = cancelResult.old_time || "";
   const oldService = cancelResult.old_service || "appointment";
-  console.log(`Old appointment saved: time=${oldTime}, service=${oldService}`);
+  const oldTimeArabic = formatTimeArabic(oldTimeRaw);
+  console.log(`Old appointment saved: raw=${oldTimeRaw}, arabic=${oldTimeArabic}, service=${oldService}`);
 
   // Step 2: Book the new time
   console.log("RESCHEDULE Step 2: Booking new time...");
@@ -258,7 +288,7 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
     console.log("RESCHEDULE complete: new time booked successfully.");
     return {
       status: "rescheduled",
-      old_time: oldTime,
+      old_time: oldTimeArabic,
       new_time: rescheduleParams.new_time,
       service: rescheduleParams.service || oldService,
     };
@@ -270,7 +300,7 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
   const rebookParams = {
     name: rescheduleParams.name || "",
     phone: rescheduleParams.phone || patientPhone,
-    time: oldTime,
+    time: oldTimeRaw,
     service: rescheduleParams.service || oldService,
   };
   const rebookResult = await triggerBooking(rebookParams, patientPhone);
