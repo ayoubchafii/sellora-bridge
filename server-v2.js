@@ -14,6 +14,7 @@ const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID;
 const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const AWS_REGION = process.env.AWS_REGION || "us-east-1";
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
+const CANCEL_WEBHOOK_URL = process.env.CANCEL_WEBHOOK_URL;
 
 const MODEL_ID = "global.anthropic.claude-sonnet-4-6";
 
@@ -65,9 +66,45 @@ function extractBookingTag(text) {
   return params;
 }
 
-// ── Strip [BOOKING:...] tag from message text
-function stripBookingTag(text) {
-  return text.replace(/\[BOOKING:[^\]]+\]/g, "").trim();
+// ── Parse [CANCEL:...] tag from Sara's response
+function extractCancelTag(text) {
+  const match = text.match(/\[CANCEL:([^\]]+)\]/);
+  if (!match) return null;
+
+  const params = {};
+  match[1].split(",").forEach(pair => {
+    const [key, ...valueParts] = pair.split("=");
+    if (key && valueParts.length > 0) {
+      params[key.trim()] = valueParts.join("=").trim();
+    }
+  });
+
+  return params;
+}
+
+// ── Parse [RESCHEDULE:...] tag from Sara's response
+function extractRescheduleTag(text) {
+  const match = text.match(/\[RESCHEDULE:([^\]]+)\]/);
+  if (!match) return null;
+
+  const params = {};
+  match[1].split(",").forEach(pair => {
+    const [key, ...valueParts] = pair.split("=");
+    if (key && valueParts.length > 0) {
+      params[key.trim()] = valueParts.join("=").trim();
+    }
+  });
+
+  return params;
+}
+
+// ── Strip all hidden tags from message text
+function stripAllTags(text) {
+  return text
+    .replace(/\[BOOKING:[^\]]+\]/g, "")
+    .replace(/\[CANCEL:[^\]]+\]/g, "")
+    .replace(/\[RESCHEDULE:[^\]]+\]/g, "")
+    .trim();
 }
 
 // ── Send WhatsApp message
@@ -89,7 +126,7 @@ async function sendWhatsApp(to, message) {
   );
 }
 
-// ── Call Make.com webhook and WAIT for JSON response
+// ── Call Make.com BOOKING webhook and WAIT for JSON response
 async function triggerBooking(bookingParams, patientPhone) {
   if (!MAKE_WEBHOOK_URL) {
     console.error("MAKE_WEBHOOK_URL not set");
@@ -105,20 +142,122 @@ async function triggerBooking(bookingParams, patientPhone) {
     clinic_owner_phone: process.env.CLINIC_OWNER_PHONE || "",
   };
 
-  console.log("Triggering Make.com webhook:", payload);
+  console.log("Triggering BOOKING webhook:", payload);
 
   try {
     const response = await axios.post(MAKE_WEBHOOK_URL, payload, {
       headers: { "Content-Type": "application/json" },
-      timeout: 15000, // 15 second timeout
+      timeout: 15000,
     });
 
-    console.log("Make.com response:", response.data);
+    console.log("Booking response:", response.data);
     return response.data;
   } catch (err) {
-    console.error("Make.com error:", err.message);
+    console.error("Booking webhook error:", err.message);
     return { status: "error" };
   }
+}
+
+// ── Call Make.com CANCEL webhook and WAIT for JSON response
+async function triggerCancel(cancelParams, patientPhone) {
+  if (!CANCEL_WEBHOOK_URL) {
+    console.error("CANCEL_WEBHOOK_URL not set");
+    return { status: "error" };
+  }
+
+  const payload = {
+    name: cancelParams.name || "",
+    phone: cancelParams.phone || patientPhone,
+    current_utc: new Date().toISOString().replace("Z", "+00:00"),
+  };
+
+  console.log("Triggering CANCEL webhook:", payload);
+
+  try {
+    const response = await axios.post(CANCEL_WEBHOOK_URL, payload, {
+      headers: { "Content-Type": "application/json" },
+      timeout: 15000,
+    });
+
+    console.log("Cancel response:", response.data);
+    return response.data;
+  } catch (err) {
+    console.error("Cancel webhook error:", err.message);
+    return { status: "error" };
+  }
+}
+
+// ── Handle RESCHEDULE: cancel old → book new → if fail → re-book old
+async function triggerReschedule(rescheduleParams, patientPhone) {
+
+  // Step 1: Cancel the old appointment first
+  console.log("RESCHEDULE Step 1: Cancelling old appointment...");
+  const cancelParams = {
+    name: rescheduleParams.name || "",
+    phone: rescheduleParams.phone || patientPhone,
+  };
+  const cancelResult = await triggerCancel(cancelParams, patientPhone);
+
+  // If no appointment found, stop
+  if (cancelResult.status === "not_found") {
+    console.log("RESCHEDULE failed: no existing appointment found.");
+    return { status: "not_found" };
+  }
+
+  // If cancel errored, stop
+  if (cancelResult.status === "error") {
+    console.log("RESCHEDULE failed: cancel error.");
+    return { status: "error" };
+  }
+
+  // Save old event details for potential re-booking
+  const oldTime = cancelResult.old_time || "";
+  const oldService = cancelResult.old_service || "appointment";
+  console.log(`Old appointment saved: time=${oldTime}, service=${oldService}`);
+
+  // Step 2: Book the new time
+  console.log("RESCHEDULE Step 2: Booking new time...");
+  const bookingParams = {
+    name: rescheduleParams.name || "",
+    phone: rescheduleParams.phone || patientPhone,
+    time: rescheduleParams.new_time || "",
+    service: rescheduleParams.service || oldService,
+  };
+  const bookResult = await triggerBooking(bookingParams, patientPhone);
+
+  // If new time booked successfully, done!
+  if (bookResult.status === "booked") {
+    console.log("RESCHEDULE complete: new time booked successfully.");
+    return {
+      status: "rescheduled",
+      time: rescheduleParams.new_time,
+      service: rescheduleParams.service || oldService,
+    };
+  }
+
+  // Step 3: New time failed — re-book the old time to restore it
+  console.log(`RESCHEDULE Step 3: New time failed (${bookResult.status}). Re-booking old time...`);
+
+  // Extract the old event name to get original patient name format
+  // old_service from cancel response is actually the event Summary like "سعد—تبييض الأسنان"
+  const rebookParams = {
+    name: rescheduleParams.name || "",
+    phone: rescheduleParams.phone || patientPhone,
+    time: oldTime,
+    service: rescheduleParams.service || oldService,
+  };
+  const rebookResult = await triggerBooking(rebookParams, patientPhone);
+  console.log(`Re-book old time result: ${rebookResult.status}`);
+
+  if (bookResult.status === "busy") {
+    return { status: "reschedule_failed_busy" };
+  }
+
+  if (bookResult.status === "outside_hours") {
+    return { status: "reschedule_failed_outside_hours" };
+  }
+
+  return { status: "error" };
 }
 
 // ── Call Claude via AWS Bedrock
@@ -181,33 +320,56 @@ app.post("/webhook", async (req, res) => {
     const saraResponse = await callClaude(userPhone, userText);
     console.log(`Sara raw response: ${saraResponse}`);
 
-    // ── Check if Sara included a booking tag
+    // ── Check which tag Sara included
     const bookingParams = extractBookingTag(saraResponse);
+    const cancelParams = extractCancelTag(saraResponse);
+    const rescheduleParams = extractRescheduleTag(saraResponse);
 
     if (bookingParams) {
-      // ── BOOKING FLOW: don't send Sara's first response, check calendar first
+      // ── BOOKING FLOW
       console.log("Booking detected:", bookingParams);
-
-      // Call Make.com and WAIT for the result
       const makeResult = await triggerBooking(bookingParams, userPhone);
       console.log("Calendar result:", makeResult);
 
-      // Inject the result into the conversation as a system message
       const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(makeResult)}]`;
-      
-      // Second call: Sara reads the result and responds naturally
       const finalResponse = await callClaude(userPhone, resultMessage);
-      console.log(`Sara final response: ${finalResponse}`);
+      const cleanFinal = stripAllTags(finalResponse);
+      if (!cleanFinal) return;
 
-      const cleanFinal = stripBookingTag(finalResponse);
+      await sendWhatsApp(userPhone, cleanFinal);
+      console.log(`Replied to ${userPhone}: ${cleanFinal}`);
+
+    } else if (cancelParams) {
+      // ── CANCEL FLOW
+      console.log("Cancel detected:", cancelParams);
+      const cancelResult = await triggerCancel(cancelParams, userPhone);
+      console.log("Cancel result:", cancelResult);
+
+      const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(cancelResult)}]`;
+      const finalResponse = await callClaude(userPhone, resultMessage);
+      const cleanFinal = stripAllTags(finalResponse);
+      if (!cleanFinal) return;
+
+      await sendWhatsApp(userPhone, cleanFinal);
+      console.log(`Replied to ${userPhone}: ${cleanFinal}`);
+
+    } else if (rescheduleParams) {
+      // ── RESCHEDULE FLOW
+      console.log("Reschedule detected:", rescheduleParams);
+      const rescheduleResult = await triggerReschedule(rescheduleParams, userPhone);
+      console.log("Reschedule result:", rescheduleResult);
+
+      const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(rescheduleResult)}]`;
+      const finalResponse = await callClaude(userPhone, resultMessage);
+      const cleanFinal = stripAllTags(finalResponse);
       if (!cleanFinal) return;
 
       await sendWhatsApp(userPhone, cleanFinal);
       console.log(`Replied to ${userPhone}: ${cleanFinal}`);
 
     } else {
-      // ── NORMAL FLOW: no booking, send response directly
-      const cleanResponse = stripBookingTag(saraResponse);
+      // ── NORMAL FLOW: no tags, send response directly
+      const cleanResponse = stripAllTags(saraResponse);
       if (!cleanResponse) return;
 
       await sendWhatsApp(userPhone, cleanResponse);
