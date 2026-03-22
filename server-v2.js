@@ -89,11 +89,11 @@ async function sendWhatsApp(to, message) {
   );
 }
 
-// ── Call Make.com webhook with booking data
+// ── Call Make.com webhook and WAIT for JSON response
 async function triggerBooking(bookingParams, patientPhone) {
   if (!MAKE_WEBHOOK_URL) {
     console.error("MAKE_WEBHOOK_URL not set");
-    return;
+    return { status: "error" };
   }
 
   const payload = {
@@ -107,9 +107,18 @@ async function triggerBooking(bookingParams, patientPhone) {
 
   console.log("Triggering Make.com webhook:", payload);
 
-  await axios.post(MAKE_WEBHOOK_URL, payload, {
-    headers: { "Content-Type": "application/json" },
-  });
+  try {
+    const response = await axios.post(MAKE_WEBHOOK_URL, payload, {
+      headers: { "Content-Type": "application/json" },
+      timeout: 15000, // 15 second timeout
+    });
+
+    console.log("Make.com response:", response.data);
+    return response.data;
+  } catch (err) {
+    console.error("Make.com error:", err.message);
+    return { status: "error" };
+  }
 }
 
 // ── Call Claude via AWS Bedrock
@@ -168,22 +177,42 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`Incoming from ${userPhone}: ${userText}`);
 
+    // ── First call: Sara responds to the patient's message
     const saraResponse = await callClaude(userPhone, userText);
     console.log(`Sara raw response: ${saraResponse}`);
 
+    // ── Check if Sara included a booking tag
     const bookingParams = extractBookingTag(saraResponse);
+
     if (bookingParams) {
+      // ── BOOKING FLOW: don't send Sara's first response, check calendar first
       console.log("Booking detected:", bookingParams);
-      triggerBooking(bookingParams, userPhone).catch(err =>
-        console.error("Make.com webhook error:", err.message)
-      );
+
+      // Call Make.com and WAIT for the result
+      const makeResult = await triggerBooking(bookingParams, userPhone);
+      console.log("Calendar result:", makeResult);
+
+      // Inject the result into the conversation as a system message
+      const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(makeResult)}]`;
+      
+      // Second call: Sara reads the result and responds naturally
+      const finalResponse = await callClaude(userPhone, resultMessage);
+      console.log(`Sara final response: ${finalResponse}`);
+
+      const cleanFinal = stripBookingTag(finalResponse);
+      if (!cleanFinal) return;
+
+      await sendWhatsApp(userPhone, cleanFinal);
+      console.log(`Replied to ${userPhone}: ${cleanFinal}`);
+
+    } else {
+      // ── NORMAL FLOW: no booking, send response directly
+      const cleanResponse = stripBookingTag(saraResponse);
+      if (!cleanResponse) return;
+
+      await sendWhatsApp(userPhone, cleanResponse);
+      console.log(`Replied to ${userPhone}: ${cleanResponse}`);
     }
-
-    const cleanResponse = stripBookingTag(saraResponse);
-    if (!cleanResponse) return;
-
-    await sendWhatsApp(userPhone, cleanResponse);
-    console.log(`Replied to ${userPhone}: ${cleanResponse}`);
 
   } catch (err) {
     console.error("Error:", err.response?.data || err.message);
