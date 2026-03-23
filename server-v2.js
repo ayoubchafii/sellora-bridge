@@ -206,6 +206,7 @@ async function queryDayAvailability(searchStart, searchEnd) {
   }
 
   const payload = {
+    type: "search",
     search_date_start: searchStart,
     search_date_end: searchEnd,
   };
@@ -523,6 +524,7 @@ async function triggerCancel(cancelParams, patientPhone) {
   }
 
   const payload = {
+    type: "cancel",
     name: cancelParams.name || "",
     phone: cancelParams.phone || patientPhone,
     current_utc: new Date().toISOString().replace("Z", "+00:00"),
