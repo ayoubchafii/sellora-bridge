@@ -15,9 +15,15 @@ const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const AWS_REGION = process.env.AWS_REGION || "us-east-1";
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
 const CANCEL_WEBHOOK_URL = process.env.CANCEL_WEBHOOK_URL;
+const SEARCH_WEBHOOK_URL = process.env.SEARCH_WEBHOOK_URL;
 const CLINIC_OWNER_PHONE = process.env.CLINIC_OWNER_PHONE || "";
 
 const MODEL_ID = "global.anthropic.claude-sonnet-4-6";
+
+// ── Clinic working hours in UTC (Gulf 9AM-6PM = UTC 6AM-3PM)
+const WORKING_HOURS_START_UTC = 6;  // 9AM Gulf
+const WORKING_HOURS_END_UTC = 15;   // 6PM Gulf
+const SLOT_DURATION_MIN = 30;
 
 // ── Load Sara's prompt from external file
 const SARA_SYSTEM_PROMPT = fs.readFileSync("sara_prompt.txt", "utf8");
@@ -35,6 +41,9 @@ const bedrockClient = new BedrockRuntimeClient({
 // ── In-memory conversation history per user (phone → messages array)
 const conversationHistory = new Map();
 const MAX_HISTORY = 20;
+
+// ── Track last suggested time per user for race condition detection
+const lastSuggestedTime = new Map();
 
 function getHistory(phone) {
   if (!conversationHistory.has(phone)) {
@@ -54,12 +63,10 @@ function addToHistory(phone, role, content) {
 // ── Convert UTC datetime string to readable Arabic (Gulf time UTC+3)
 function formatTimeArabic(isoString) {
   try {
-    // Handle various formats from Google Calendar
     const cleaned = String(isoString).trim();
     const date = new Date(cleaned);
 
     if (isNaN(date.getTime())) {
-      // If parsing fails, return the original string
       return isoString;
     }
 
@@ -70,11 +77,15 @@ function formatTimeArabic(isoString) {
     const dayName = days[gulfDate.getUTCDay()];
 
     let hours = gulfDate.getUTCHours();
+    const minutes = gulfDate.getUTCMinutes();
     const period = hours >= 12 ? "مساءً" : "صباحاً";
     if (hours > 12) hours -= 12;
     if (hours === 0) hours = 12;
 
-    return `${dayName} الساعة ${hours} ${period}`;
+    // Include minutes only if not zero (e.g., "2:30" but not "2:00")
+    const timeStr = minutes > 0 ? `${hours}:${String(minutes).padStart(2, "0")}` : `${hours}`;
+
+    return `${dayName} الساعة ${timeStr} ${period}`;
   } catch (err) {
     return isoString;
   }
@@ -182,6 +193,295 @@ async function notifyClinicOwner(type, details) {
     console.error("Clinic notification error:", err.message);
   }
 }
+
+// ══════════════════════════════════════════════════════════════
+// ── ALTERNATIVE TIME SUGGESTIONS (Phase 3)
+// ══════════════════════════════════════════════════════════════
+
+// ── Call Make.com search-availability webhook to get busy times for a day
+async function queryDayAvailability(searchStart, searchEnd) {
+  if (!SEARCH_WEBHOOK_URL) {
+    console.error("SEARCH_WEBHOOK_URL not set");
+    return [];
+  }
+
+  const payload = {
+    search_date_start: searchStart,
+    search_date_end: searchEnd,
+  };
+
+  console.log("Querying availability:", payload);
+
+  try {
+    const response = await axios.post(SEARCH_WEBHOOK_URL, payload, {
+      headers: { "Content-Type": "application/json" },
+      timeout: 15000,
+    });
+
+    const busyTimesStr = response.data?.busy_times || "";
+    if (!busyTimesStr) {
+      console.log("No busy times — entire window is free");
+      return [];
+    }
+
+    // Parse "start~end|start~end|..." format
+    const busyPeriods = [];
+    const entries = busyTimesStr.split("|");
+    for (const entry of entries) {
+      const parts = entry.split("~");
+      if (parts.length === 2) {
+        const start = new Date(parts[0].trim());
+        const end = new Date(parts[1].trim());
+        if (!isNaN(start.getTime()) && !isNaN(end.getTime())) {
+          busyPeriods.push({ start, end });
+        }
+      }
+    }
+
+    console.log(`Found ${busyPeriods.length} busy periods`);
+    return busyPeriods;
+  } catch (err) {
+    console.error("Search availability error:", err.message);
+    return [];
+  }
+}
+
+// ── Calculate all free 30-min slots in a window given busy periods
+function calculateFreeSlots(busyPeriods, windowStartUTC, windowEndUTC) {
+  const slots = [];
+  const slotMs = SLOT_DURATION_MIN * 60 * 1000;
+
+  // Generate every 30-min slot in the window
+  let cursor = new Date(windowStartUTC).getTime();
+  const endMs = new Date(windowEndUTC).getTime();
+
+  while (cursor + slotMs <= endMs) {
+    const slotStart = cursor;
+    const slotEnd = cursor + slotMs;
+
+    // Check if this slot overlaps with any busy period
+    let isBusy = false;
+    for (const busy of busyPeriods) {
+      const busyStart = busy.start.getTime();
+      const busyEnd = busy.end.getTime();
+      // Overlap: slot starts before busy ends AND slot ends after busy starts
+      if (slotStart < busyEnd && slotEnd > busyStart) {
+        isBusy = true;
+        break;
+      }
+    }
+
+    if (!isBusy) {
+      slots.push(new Date(slotStart));
+    }
+
+    cursor += slotMs;
+  }
+
+  return slots;
+}
+
+// ── Get working hours window (UTC) for a given date
+function getWorkingWindow(date) {
+  const d = new Date(date);
+  const year = d.getUTCFullYear();
+  const month = d.getUTCMonth();
+  const day = d.getUTCDate();
+
+  const start = new Date(Date.UTC(year, month, day, WORKING_HOURS_START_UTC, 0, 0));
+  const end = new Date(Date.UTC(year, month, day, WORKING_HOURS_END_UTC, 0, 0));
+
+  return { start, end };
+}
+
+// ── Get next working day (skip Sunday — clinic is Mon-Sat)
+function getNextWorkingDay(date) {
+  const d = new Date(date);
+  d.setUTCDate(d.getUTCDate() + 1);
+
+  // Sunday = 0 in UTC. Gulf Sunday = UTC could be Sat night or Sun.
+  // Gulf calendar: Mon-Sat open, Sun closed.
+  // We work with Gulf day: add 3h to UTC to get Gulf day.
+  const gulfDate = new Date(d.getTime() + 3 * 60 * 60 * 1000);
+  if (gulfDate.getUTCDay() === 0) {
+    // Gulf Sunday — skip to Monday
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+
+  return d;
+}
+
+// ── Pick the best slot from a list: prefer forward from requested, then backward
+function pickClosestSlot(freeSlots, requestedTime) {
+  if (freeSlots.length === 0) return null;
+
+  const reqMs = new Date(requestedTime).getTime();
+
+  // Separate into forward (after requested) and backward (before requested)
+  const forward = freeSlots.filter(s => s.getTime() >= reqMs);
+  const backward = freeSlots.filter(s => s.getTime() < reqMs);
+
+  // Prefer forward first, then backward — both sorted by proximity
+  forward.sort((a, b) => a.getTime() - b.getTime());
+  backward.sort((a, b) => b.getTime() - a.getTime());
+
+  if (forward.length > 0) return forward[0];
+  if (backward.length > 0) return backward[0];
+  return null;
+}
+
+// ── THE WATERFALL: Find alternative time (5-step search)
+async function findAlternative(utcStart) {
+  try {
+    const requested = new Date(utcStart);
+    if (isNaN(requested.getTime())) {
+      console.error("findAlternative: invalid utcStart:", utcStart);
+      return null;
+    }
+
+    console.log(`WATERFALL: Starting search for alternative to ${utcStart}`);
+
+    // ── DAY 1 (same day as requested) ──
+    const day1Window = getWorkingWindow(requested);
+    const day1Start = day1Window.start.toISOString().replace("Z", "+00:00");
+    const day1End = day1Window.end.toISOString().replace("Z", "+00:00");
+
+    const day1Busy = await queryDayAvailability(day1Start, day1End);
+    const day1FreeAll = calculateFreeSlots(day1Busy, day1Window.start, day1Window.end);
+
+    // Step 1: ±2h from requested, clamped to working hours
+    const twoHoursMs = 2 * 60 * 60 * 1000;
+    const range1Start = new Date(Math.max(requested.getTime() - twoHoursMs, day1Window.start.getTime()));
+    const range1End = new Date(Math.min(requested.getTime() + twoHoursMs + SLOT_DURATION_MIN * 60 * 1000, day1Window.end.getTime()));
+
+    const step1Slots = day1FreeAll.filter(s =>
+      s.getTime() >= range1Start.getTime() && s.getTime() < range1End.getTime()
+    );
+
+    const step1Pick = pickClosestSlot(step1Slots, requested);
+    if (step1Pick) {
+      console.log(`WATERFALL Step 1: Found ${step1Pick.toISOString()} (±2h same day)`);
+      return { utc: step1Pick, sameDay: true };
+    }
+
+    // Step 2: Any free slot on Day 1
+    const step2Pick = pickClosestSlot(day1FreeAll, requested);
+    if (step2Pick) {
+      console.log(`WATERFALL Step 2: Found ${step2Pick.toISOString()} (same day, any time)`);
+      return { utc: step2Pick, sameDay: true };
+    }
+
+    // ── DAY 2 (next working day) ──
+    const day2Date = getNextWorkingDay(requested);
+    const day2Window = getWorkingWindow(day2Date);
+    const day2Start = day2Window.start.toISOString().replace("Z", "+00:00");
+    const day2End = day2Window.end.toISOString().replace("Z", "+00:00");
+
+    const day2Busy = await queryDayAvailability(day2Start, day2End);
+    const day2FreeAll = calculateFreeSlots(day2Busy, day2Window.start, day2Window.end);
+
+    // Step 3: Exact same time on Day 2
+    // Calculate the same Gulf hour on Day 2
+    const requestedHourUTC = requested.getUTCHours();
+    const requestedMinUTC = requested.getUTCMinutes();
+    const day2SameTime = new Date(Date.UTC(
+      day2Window.start.getUTCFullYear(),
+      day2Window.start.getUTCMonth(),
+      day2Window.start.getUTCDate(),
+      requestedHourUTC,
+      requestedMinUTC,
+      0
+    ));
+
+    // Check if exact time is in the free list
+    const step3Match = day2FreeAll.find(s => s.getTime() === day2SameTime.getTime());
+    if (step3Match) {
+      console.log(`WATERFALL Step 3: Found ${step3Match.toISOString()} (exact time, next day)`);
+      return { utc: step3Match, sameDay: false };
+    }
+
+    // Step 4: ±2h on Day 2
+    const range4Start = new Date(Math.max(day2SameTime.getTime() - twoHoursMs, day2Window.start.getTime()));
+    const range4End = new Date(Math.min(day2SameTime.getTime() + twoHoursMs + SLOT_DURATION_MIN * 60 * 1000, day2Window.end.getTime()));
+
+    const step4Slots = day2FreeAll.filter(s =>
+      s.getTime() >= range4Start.getTime() && s.getTime() < range4End.getTime()
+    );
+
+    const step4Pick = pickClosestSlot(step4Slots, day2SameTime);
+    if (step4Pick) {
+      console.log(`WATERFALL Step 4: Found ${step4Pick.toISOString()} (±2h next day)`);
+      return { utc: step4Pick, sameDay: false };
+    }
+
+    // Step 5: Any free slot on Day 2
+    const step5Pick = pickClosestSlot(day2FreeAll, day2SameTime);
+    if (step5Pick) {
+      console.log(`WATERFALL Step 5: Found ${step5Pick.toISOString()} (next day, any time)`);
+      return { utc: step5Pick, sameDay: false };
+    }
+
+    // Step 6: Both days fully booked
+    console.log("WATERFALL: No alternative found in 2 days");
+    return null;
+
+  } catch (err) {
+    console.error("findAlternative error:", err.message);
+    return null;
+  }
+}
+
+// ── Build SYSTEM_RESULT for busy with alternative
+function buildBusyResult(alternative, userPhone) {
+  // Check for race condition: was this a retry of a previously suggested time?
+  const isRetry = checkAndClearRetry(userPhone);
+
+  if (!alternative) {
+    return {
+      status: "busy",
+      alternative: null,
+      same_day: false,
+      retry: isRetry,
+    };
+  }
+
+  const altArabic = formatTimeArabic(alternative.utc.toISOString());
+
+  // Store this suggestion for race condition detection
+  lastSuggestedTime.set(userPhone, alternative.utc.getTime());
+
+  return {
+    status: "busy",
+    alternative: altArabic,
+    same_day: alternative.sameDay,
+    retry: isRetry,
+  };
+}
+
+// ── Check if this is a race condition (booking failed on a previously suggested time)
+function checkAndClearRetry(userPhone) {
+  // This is called BEFORE we know the utc_start of the failed booking.
+  // We set the flag here and the caller checks it with the actual utc_start.
+  return false; // Default — actual check happens in the booking flow
+}
+
+function isRaceCondition(userPhone, failedUtcStart) {
+  const suggested = lastSuggestedTime.get(userPhone);
+  if (!suggested) return false;
+
+  const failedMs = new Date(failedUtcStart).getTime();
+  const diffMs = Math.abs(suggested - failedMs);
+
+  // Clear the flag regardless
+  lastSuggestedTime.delete(userPhone);
+
+  // If the failed time is within 5 minutes of what we suggested, it's a race condition
+  return diffMs < 5 * 60 * 1000;
+}
+
+// ══════════════════════════════════════════════════════════════
+// ── END Phase 3 functions
+// ══════════════════════════════════════════════════════════════
 
 // ── Call Make.com BOOKING webhook and WAIT for JSON response
 async function triggerBooking(bookingParams, patientPhone) {
@@ -306,8 +606,19 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
   const rebookResult = await triggerBooking(rebookParams, patientPhone);
   console.log(`Re-book old time result: ${rebookResult.status}`);
 
-  if (bookResult.status === "busy") {
-    return { status: "reschedule_failed_busy", rebookSilent: true };
+  // Run waterfall to find alternative for the failed reschedule
+  if (bookResult.status === "busy" && bookResult.utc_start) {
+    const alternative = await findAlternative(bookResult.utc_start);
+    if (alternative) {
+      const altArabic = formatTimeArabic(alternative.utc.toISOString());
+      return {
+        status: "reschedule_failed_busy",
+        alternative: altArabic,
+        same_day: alternative.sameDay,
+        rebookSilent: true,
+      };
+    }
+    return { status: "reschedule_failed_busy", alternative: null, rebookSilent: true };
   }
 
   if (bookResult.status === "outside_hours") {
@@ -388,7 +699,41 @@ app.post("/webhook", async (req, res) => {
       const makeResult = await triggerBooking(bookingParams, userPhone);
       console.log("Calendar result:", makeResult);
 
-      const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(makeResult)}]`;
+      let resultToInject;
+
+      if (makeResult.status === "busy") {
+        // ── PHASE 3: Run waterfall search for alternative
+        const retry = isRaceCondition(userPhone, makeResult.utc_start || "");
+
+        const alternative = await findAlternative(makeResult.utc_start || "");
+        if (alternative) {
+          const altArabic = formatTimeArabic(alternative.utc.toISOString());
+          // Store suggestion for race condition detection on next attempt
+          lastSuggestedTime.set(userPhone, alternative.utc.getTime());
+          resultToInject = {
+            status: "busy",
+            alternative: altArabic,
+            same_day: alternative.sameDay,
+            retry: retry,
+          };
+        } else {
+          resultToInject = {
+            status: "busy",
+            alternative: null,
+            same_day: false,
+            retry: retry,
+          };
+        }
+      } else {
+        // booked, outside_hours, error — pass through as-is
+        resultToInject = makeResult;
+        // Clear any pending suggestion if booking succeeded
+        if (makeResult.status === "booked") {
+          lastSuggestedTime.delete(userPhone);
+        }
+      }
+
+      const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(resultToInject)}]`;
       const finalResponse = await callClaude(userPhone, resultMessage);
       const cleanFinal = stripAllTags(finalResponse);
       if (!cleanFinal) return;
@@ -407,7 +752,7 @@ app.post("/webhook", async (req, res) => {
       }
 
     } else if (cancelParams) {
-      // ── CANCEL FLOW
+      // ── CANCEL FLOW (unchanged)
       console.log("Cancel detected:", cancelParams);
       const cancelResult = await triggerCancel(cancelParams, userPhone);
       console.log("Cancel result:", cancelResult);
@@ -429,7 +774,7 @@ app.post("/webhook", async (req, res) => {
       }
 
     } else if (rescheduleParams) {
-      // ── RESCHEDULE FLOW
+      // ── RESCHEDULE FLOW (with alternatives for failed reschedules)
       console.log("Reschedule detected:", rescheduleParams);
       const rescheduleResult = await triggerReschedule(rescheduleParams, userPhone);
       console.log("Reschedule result:", rescheduleResult);
