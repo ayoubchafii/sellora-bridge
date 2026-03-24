@@ -17,6 +17,8 @@ const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
 const CANCEL_WEBHOOK_URL = process.env.CANCEL_WEBHOOK_URL;
 const SEARCH_WEBHOOK_URL = process.env.SEARCH_WEBHOOK_URL;
 const CLINIC_OWNER_PHONE = process.env.CLINIC_OWNER_PHONE || "";
+const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
 const MODEL_ID = "global.anthropic.claude-sonnet-4-6";
 
@@ -24,6 +26,12 @@ const MODEL_ID = "global.anthropic.claude-sonnet-4-6";
 const WORKING_HOURS_START_UTC = 6;  // 9AM Gulf
 const WORKING_HOURS_END_UTC = 15;   // 6PM Gulf
 const SLOT_DURATION_MIN = 30;
+
+// ── Expiry times
+const CONV_EXPIRY_SECONDS = 7 * 24 * 60 * 60;       // 7 days for conversation history
+const PATIENT_EXPIRY_NORMAL = 7 * 24 * 60 * 60;      // 7 days for new patients
+const PATIENT_EXPIRY_LOYAL = 90 * 24 * 60 * 60;      // 90 days for loyal patients (3+ bookings)
+const LOYAL_BOOKING_THRESHOLD = 3;
 
 // ── Load Sara's prompt from external file
 const SARA_SYSTEM_PROMPT = fs.readFileSync("sara_prompt.txt", "utf8");
@@ -38,26 +46,114 @@ const bedrockClient = new BedrockRuntimeClient({
   },
 });
 
-// ── In-memory conversation history per user (phone → messages array)
-const conversationHistory = new Map();
-const MAX_HISTORY = 20;
+// ══════════════════════════════════════════════════════════════
+// ── UPSTASH REDIS HELPERS
+// ══════════════════════════════════════════════════════════════
 
-// ── Track last suggested time per user for race condition detection
-const lastSuggestedTime = new Map();
-
-function getHistory(phone) {
-  if (!conversationHistory.has(phone)) {
-    conversationHistory.set(phone, []);
+async function redisCommand(command) {
+  try {
+    const response = await axios.post(
+      `${UPSTASH_REDIS_REST_URL}`,
+      command,
+      {
+        headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` },
+        timeout: 5000,
+      }
+    );
+    return response.data?.result;
+  } catch (err) {
+    console.error("Redis error:", err.message);
+    return null;
   }
-  return conversationHistory.get(phone);
 }
 
-function addToHistory(phone, role, content) {
-  const history = getHistory(phone);
+async function redisGet(key) {
+  return await redisCommand(["GET", key]);
+}
+
+async function redisSet(key, value, expirySeconds) {
+  return await redisCommand(["SET", key, value, "EX", String(expirySeconds)]);
+}
+
+async function redisDel(key) {
+  return await redisCommand(["DEL", key]);
+}
+
+// ── Conversation history (Redis-backed)
+const MAX_HISTORY = 20;
+
+async function getHistory(phone) {
+  const data = await redisGet(`conv:${phone}`);
+  if (data) {
+    try {
+      return JSON.parse(data);
+    } catch (e) {
+      return [];
+    }
+  }
+  return [];
+}
+
+async function addToHistory(phone, role, content) {
+  const history = await getHistory(phone);
   history.push({ role, content });
   if (history.length > MAX_HISTORY) {
     history.splice(0, history.length - MAX_HISTORY);
   }
+  await redisSet(`conv:${phone}`, JSON.stringify(history), CONV_EXPIRY_SECONDS);
+}
+
+// ── Patient profiles (Redis-backed)
+async function getPatientProfile(phone) {
+  const data = await redisGet(`patient:${phone}`);
+  if (data) {
+    try {
+      return JSON.parse(data);
+    } catch (e) {
+      return null;
+    }
+  }
+  return null;
+}
+
+async function savePatientProfile(phone, name, service) {
+  const existing = await getPatientProfile(phone);
+  const bookings = existing ? (existing.bookings || 0) + 1 : 1;
+  const profile = {
+    name: name || (existing && existing.name) || "",
+    phone: phone,
+    bookings: bookings,
+    last_service: service || (existing && existing.last_service) || "",
+    last_visit: new Date().toISOString(),
+  };
+
+  const expiry = bookings >= LOYAL_BOOKING_THRESHOLD ? PATIENT_EXPIRY_LOYAL : PATIENT_EXPIRY_NORMAL;
+  await redisSet(`patient:${phone}`, JSON.stringify(profile), expiry);
+  console.log(`Patient profile saved: ${name}, bookings: ${bookings}, expiry: ${expiry / 86400} days`);
+  return profile;
+}
+
+// ── Last suggested time (Redis-backed, short expiry)
+async function getLastSuggested(phone) {
+  const data = await redisGet(`suggested:${phone}`);
+  return data ? parseInt(data) : null;
+}
+
+async function setLastSuggested(phone, utcMs) {
+  // 10 minute expiry — race condition window
+  await redisSet(`suggested:${phone}`, String(utcMs), 600);
+}
+
+async function clearLastSuggested(phone) {
+  await redisDel(`suggested:${phone}`);
+}
+
+// ── RESET command for testing
+async function resetPatientData(phone) {
+  await redisDel(`conv:${phone}`);
+  await redisDel(`patient:${phone}`);
+  await redisDel(`suggested:${phone}`);
+  console.log(`RESET: Cleared all data for ${phone}`);
 }
 
 // ── Convert UTC datetime string to readable Arabic (Gulf time UTC+3)
@@ -450,48 +546,16 @@ async function findAlternative(utcStart) {
 }
 
 // ── Build SYSTEM_RESULT for busy with alternative
-function buildBusyResult(alternative, userPhone) {
-  // Check for race condition: was this a retry of a previously suggested time?
-  const isRetry = checkAndClearRetry(userPhone);
-
-  if (!alternative) {
-    return {
-      status: "busy",
-      alternative: null,
-      same_day: false,
-      retry: isRetry,
-    };
-  }
-
-  const altArabic = formatTimeArabic(alternative.utc.toISOString());
-
-  // Store this suggestion for race condition detection
-  lastSuggestedTime.set(userPhone, alternative.utc.getTime());
-
-  return {
-    status: "busy",
-    alternative: altArabic,
-    same_day: alternative.sameDay,
-    retry: isRetry,
-  };
-}
-
 // ── Check if this is a race condition (booking failed on a previously suggested time)
-function checkAndClearRetry(userPhone) {
-  // This is called BEFORE we know the utc_start of the failed booking.
-  // We set the flag here and the caller checks it with the actual utc_start.
-  return false; // Default — actual check happens in the booking flow
-}
-
-function isRaceCondition(userPhone, failedUtcStart) {
-  const suggested = lastSuggestedTime.get(userPhone);
+async function isRaceCondition(userPhone, failedUtcStart) {
+  const suggested = await getLastSuggested(userPhone);
   if (!suggested) return false;
 
   const failedMs = new Date(failedUtcStart).getTime();
   const diffMs = Math.abs(suggested - failedMs);
 
   // Clear the flag regardless
-  lastSuggestedTime.delete(userPhone);
+  await clearLastSuggested(userPhone);
 
   // If the failed time is within 5 minutes of what we suggested, it's a race condition
   return diffMs < 5 * 60 * 1000;
@@ -773,12 +837,19 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
 
 // ── Call Claude via AWS Bedrock
 async function callClaude(userPhone, userMessage) {
-  addToHistory(userPhone, "user", userMessage);
+  await addToHistory(userPhone, "user", userMessage);
 
-  const history = getHistory(userPhone);
+  const history = await getHistory(userPhone);
 
-  // Inject patient's WhatsApp number into system prompt
-  const dynamicPrompt = SARA_SYSTEM_PROMPT + `\n\nرقم واتساب المريض الحالي: ${userPhone}`;
+  // Inject patient's WhatsApp number and profile into system prompt
+  let dynamicPrompt = SARA_SYSTEM_PROMPT + `\n\nرقم واتساب المريض الحالي: ${userPhone}`;
+
+  // Check if we know this patient
+  const profile = await getPatientProfile(userPhone);
+  if (profile && profile.name) {
+    dynamicPrompt += `\nهذا المريض معروف. اسمه: ${profile.name}. عدد حجوزاته السابقة: ${profile.bookings}. آخر خدمة: ${profile.last_service}.`;
+    dynamicPrompt += `\nرحّب به باسمه بشكل طبيعي ودافئ. لا تسأله عن اسمه أو رقمه --- أنت تعرفهم.`;
+  }
 
   const command = new ConverseCommand({
     modelId: MODEL_ID,
@@ -796,7 +867,7 @@ async function callClaude(userPhone, userMessage) {
   const response = await bedrockClient.send(command);
   const assistantMessage = response.output.message.content[0].text;
 
-  addToHistory(userPhone, "assistant", assistantMessage);
+  await addToHistory(userPhone, "assistant", assistantMessage);
 
   return assistantMessage;
 }
@@ -826,6 +897,14 @@ app.post("/webhook", async (req, res) => {
     if (!message) return;
 
     const userPhone = message.from;
+
+    // ── RESET command: clear all data for testing (only from clinic owner)
+    if (message.type === "text" && message.text.body.trim().toUpperCase() === "RESET" && userPhone === CLINIC_OWNER_PHONE) {
+      await resetPatientData(userPhone);
+      await sendWhatsApp(userPhone, "تم مسح جميع البيانات. المحادثة تبدأ من جديد.");
+      console.log(`RESET triggered by ${userPhone}`);
+      return;
+    }
 
     // ── Handle reactions: ignore completely (no reply needed)
     if (message.type === "reaction") return;
@@ -876,13 +955,13 @@ app.post("/webhook", async (req, res) => {
 
       if (makeResult.status === "busy") {
         // ── PHASE 3: Run waterfall search for alternative
-        const retry = isRaceCondition(userPhone, makeResult.utc_start || "");
+        const retry = await isRaceCondition(userPhone, makeResult.utc_start || "");
 
         const alternative = await findAlternative(makeResult.utc_start || "");
         if (alternative) {
           const altArabic = formatTimeArabic(alternative.utc.toISOString());
           // Store suggestion for race condition detection on next attempt
-          lastSuggestedTime.set(userPhone, alternative.utc.getTime());
+          await setLastSuggested(userPhone, alternative.utc.getTime());
           resultToInject = {
             status: "busy",
             alternative: altArabic,
@@ -902,7 +981,7 @@ app.post("/webhook", async (req, res) => {
         resultToInject = makeResult;
         // Clear any pending suggestion if booking succeeded
         if (makeResult.status === "booked") {
-          lastSuggestedTime.delete(userPhone);
+          await clearLastSuggested(userPhone);
         }
       }
 
@@ -916,6 +995,9 @@ app.post("/webhook", async (req, res) => {
 
       // Notify clinic owner for successful bookings only
       if (makeResult.status === "booked") {
+        // Save/update patient profile
+        await savePatientProfile(userPhone, bookingParams.name, bookingParams.service);
+
         await notifyClinicOwner("new_booking", {
           name: bookingParams.name,
           phone: bookingParams.phone || userPhone,
