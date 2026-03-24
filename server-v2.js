@@ -139,12 +139,29 @@ function extractRescheduleTag(text) {
   return params;
 }
 
+// ── Parse [CHECK_AVAILABILITY:...] tag from Sara's response
+function extractCheckAvailabilityTag(text) {
+  const match = text.match(/\[CHECK_AVAILABILITY:([^\]]+)\]/);
+  if (!match) return null;
+
+  const params = {};
+  match[1].split(",").forEach(pair => {
+    const [key, ...valueParts] = pair.split("=");
+    if (key && valueParts.length > 0) {
+      params[key.trim()] = valueParts.join("=").trim();
+    }
+  });
+
+  return params;
+}
+
 // ── Strip all hidden tags from message text
 function stripAllTags(text) {
   return text
     .replace(/\[BOOKING:[^\]]+\]/g, "")
     .replace(/\[CANCEL:[^\]]+\]/g, "")
     .replace(/\[RESCHEDULE:[^\]]+\]/g, "")
+    .replace(/\[CHECK_AVAILABILITY:[^\]]+\]/g, "")
     .trim();
 }
 
@@ -480,6 +497,130 @@ function isRaceCondition(userPhone, failedUtcStart) {
   return diffMs < 5 * 60 * 1000;
 }
 
+// ── Resolve day name/word to a UTC date
+function resolveDay(dayStr) {
+  const now = new Date();
+  // Current Gulf date (UTC+3)
+  const gulfNow = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  const gulfToday = new Date(Date.UTC(gulfNow.getUTCFullYear(), gulfNow.getUTCMonth(), gulfNow.getUTCDate()));
+
+  const lower = dayStr.toLowerCase().trim();
+
+  // Today
+  if (["today", "اليوم", "هلأ"].includes(lower)) {
+    return gulfToday;
+  }
+
+  // Tomorrow
+  if (["tomorrow", "غداً", "غدا", "بكرة", "بكره", "bokra"].includes(lower)) {
+    const d = new Date(gulfToday);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d;
+  }
+
+  // Day after tomorrow
+  if (["day_after_tomorrow", "بعد غد", "بعد بكرة", "بعد بكره"].includes(lower)) {
+    const d = new Date(gulfToday);
+    d.setUTCDate(d.getUTCDate() + 2);
+    return d;
+  }
+
+  // Day names → next occurrence (Gulf week: Sun=0, Mon=1, ..., Sat=6)
+  const dayMap = {
+    "sunday": 0, "الأحد": 0, "الاحد": 0,
+    "monday": 1, "الاثنين": 1, "الإثنين": 1,
+    "tuesday": 2, "الثلاثاء": 2,
+    "wednesday": 3, "الأربعاء": 3, "الاربعاء": 3,
+    "thursday": 4, "الخميس": 4,
+    "friday": 5, "الجمعة": 5,
+    "saturday": 6, "السبت": 6,
+  };
+
+  const targetDay = dayMap[lower];
+  if (targetDay !== undefined) {
+    const currentDay = gulfToday.getUTCDay();
+    let daysAhead = targetDay - currentDay;
+    if (daysAhead <= 0) daysAhead += 7; // Next week if today or past
+    const d = new Date(gulfToday);
+    d.setUTCDate(d.getUTCDate() + daysAhead);
+    return d;
+  }
+
+  // Fallback: try tomorrow
+  console.log(`resolveDay: unknown day "${dayStr}", defaulting to tomorrow`);
+  const d = new Date(gulfToday);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d;
+}
+
+// ── Select 3-4 well-spread slots across morning, midday, afternoon
+function selectSpreadSlots(freeSlots) {
+  if (freeSlots.length === 0) return [];
+  if (freeSlots.length <= 4) return freeSlots;
+
+  // Split into time windows (Gulf time = UTC + 3h)
+  // Morning: 9AM-12PM Gulf = 6:00-9:00 UTC
+  // Midday: 12PM-3PM Gulf = 9:00-12:00 UTC
+  // Afternoon: 3PM-6PM Gulf = 12:00-15:00 UTC
+  const morning = freeSlots.filter(s => s.getUTCHours() >= 6 && s.getUTCHours() < 9);
+  const midday = freeSlots.filter(s => s.getUTCHours() >= 9 && s.getUTCHours() < 12);
+  const afternoon = freeSlots.filter(s => s.getUTCHours() >= 12 && s.getUTCHours() < 15);
+
+  const picks = [];
+
+  // Pick 1 from each window if available (pick middle of each window for variety)
+  if (morning.length > 0) picks.push(morning[Math.floor(morning.length / 2)]);
+  if (midday.length > 0) picks.push(midday[Math.floor(midday.length / 2)]);
+  if (afternoon.length > 0) picks.push(afternoon[Math.floor(afternoon.length / 2)]);
+
+  // If we have fewer than 3, fill from the largest window
+  if (picks.length < 3) {
+    const all = [...morning, ...midday, ...afternoon];
+    for (const slot of all) {
+      if (picks.length >= 4) break;
+      if (!picks.find(p => p.getTime() === slot.getTime())) {
+        picks.push(slot);
+      }
+    }
+  }
+
+  // Sort chronologically
+  picks.sort((a, b) => a.getTime() - b.getTime());
+  return picks.slice(0, 4);
+}
+
+// ── Check availability for a given day — returns formatted slot list
+async function checkDayAvailability(dayStr) {
+  try {
+    const targetDate = resolveDay(dayStr);
+    const window = getWorkingWindow(targetDate);
+
+    // Check if target day is Sunday (Gulf) — clinic closed
+    const gulfDate = new Date(targetDate.getTime() + 3 * 60 * 60 * 1000);
+    if (gulfDate.getUTCDay() === 0) {
+      return { status: "closed", day: dayStr };
+    }
+
+    const searchStart = window.start.toISOString().replace("Z", "+00:00");
+    const searchEnd = window.end.toISOString().replace("Z", "+00:00");
+
+    const busyPeriods = await queryDayAvailability(searchStart, searchEnd);
+    const freeSlots = calculateFreeSlots(busyPeriods, window.start, window.end);
+
+    if (freeSlots.length === 0) {
+      return { status: "fully_booked", day: dayStr };
+    }
+
+    const selected = selectSpreadSlots(freeSlots);
+    const formatted = selected.map(s => formatTimeArabic(s.toISOString()));
+
+    return { status: "availability", slots: formatted, day: dayStr, total_free: freeSlots.length };
+  } catch (err) {
+    console.error("checkDayAvailability error:", err.message);
+    return { status: "error" };
+  }
+}
+
 // ══════════════════════════════════════════════════════════════
 // ── END Phase 3 functions
 // ══════════════════════════════════════════════════════════════
@@ -636,9 +777,12 @@ async function callClaude(userPhone, userMessage) {
 
   const history = getHistory(userPhone);
 
+  // Inject patient's WhatsApp number into system prompt
+  const dynamicPrompt = SARA_SYSTEM_PROMPT + `\n\nرقم واتساب المريض الحالي: ${userPhone}`;
+
   const command = new ConverseCommand({
     modelId: MODEL_ID,
-    system: [{ text: SARA_SYSTEM_PROMPT }],
+    system: [{ text: dynamicPrompt }],
     messages: history.map(msg => ({
       role: msg.role,
       content: [{ text: msg.content }],
@@ -694,6 +838,7 @@ app.post("/webhook", async (req, res) => {
     const bookingParams = extractBookingTag(saraResponse);
     const cancelParams = extractCancelTag(saraResponse);
     const rescheduleParams = extractRescheduleTag(saraResponse);
+    const checkAvailParams = extractCheckAvailabilityTag(saraResponse);
 
     if (bookingParams) {
       // ── BOOKING FLOW
@@ -800,6 +945,20 @@ app.post("/webhook", async (req, res) => {
         });
       }
       // Failed reschedule (re-book) → NO notification. Nothing changed for the clinic.
+
+    } else if (checkAvailParams) {
+      // ── CHECK AVAILABILITY FLOW
+      console.log("Availability check detected:", checkAvailParams);
+      const availResult = await checkDayAvailability(checkAvailParams.day || "tomorrow");
+      console.log("Availability result:", availResult);
+
+      const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(availResult)}]`;
+      const finalResponse = await callClaude(userPhone, resultMessage);
+      const cleanFinal = stripAllTags(finalResponse);
+      if (!cleanFinal) return;
+
+      await sendWhatsApp(userPhone, cleanFinal);
+      console.log(`Replied to ${userPhone}: ${cleanFinal}`);
 
     } else {
       // ── NORMAL FLOW: no tags, send response directly
