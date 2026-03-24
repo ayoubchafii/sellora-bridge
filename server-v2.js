@@ -823,9 +823,35 @@ app.post("/webhook", async (req, res) => {
     const changes = entry?.changes?.[0];
     const message = changes?.value?.messages?.[0];
 
-    if (!message || message.type !== "text") return;
+    if (!message) return;
 
     const userPhone = message.from;
+
+    // ── Handle reactions: ignore completely (no reply needed)
+    if (message.type === "reaction") return;
+
+    // ── Handle voice/audio messages: tell Sara, let her respond naturally
+    if (message.type === "audio") {
+      console.log(`Voice message from ${userPhone}`);
+      const saraResponse = await callClaude(userPhone, "[المريض أرسل رسالة صوتية. لا تستطيع سماعها. اطلب منه بلطف أن يكتب رسالته.]");
+      const cleanResponse = stripAllTags(saraResponse);
+      if (cleanResponse) {
+        await sendWhatsApp(userPhone, cleanResponse);
+        console.log(`Replied to voice from ${userPhone}: ${cleanResponse}`);
+      }
+      return;
+    }
+
+    // ── Handle image/video/document/sticker/location/contacts: hardcoded reply
+    if (["image", "video", "document", "sticker", "location", "contacts"].includes(message.type)) {
+      console.log(`Non-text message (${message.type}) from ${userPhone}`);
+      await sendWhatsApp(userPhone, "عذراً، أقدر أساعدك بالرسائل النصية فقط حالياً. ممكن تكتب لي رسالتك؟");
+      return;
+    }
+
+    // ── Only process text messages from here
+    if (message.type !== "text") return;
+
     const userText = message.text.body;
 
     console.log(`Incoming from ${userPhone}: ${userText}`);
