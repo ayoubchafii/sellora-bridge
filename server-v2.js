@@ -457,8 +457,8 @@ async function findAlternative(utcStart) {
 
     // ── DAY 1 (same day as requested) ──
     const day1Window = getWorkingWindow(requested);
-    const day1Start = day1Window.start.toISOString().replace("Z", "+00:00");
-    const day1End = day1Window.end.toISOString().replace("Z", "+00:00");
+    const day1Start = day1Window.start.toISOString().replace(".000Z", "+00:00");
+    const day1End = day1Window.end.toISOString().replace(".000Z", "+00:00");
 
     const day1Busy = await queryDayAvailability(day1Start, day1End);
     const day1FreeAll = calculateFreeSlots(day1Busy, day1Window.start, day1Window.end);
@@ -488,8 +488,8 @@ async function findAlternative(utcStart) {
     // ── DAY 2 (next working day) ──
     const day2Date = getNextWorkingDay(requested);
     const day2Window = getWorkingWindow(day2Date);
-    const day2Start = day2Window.start.toISOString().replace("Z", "+00:00");
-    const day2End = day2Window.end.toISOString().replace("Z", "+00:00");
+    const day2Start = day2Window.start.toISOString().replace(".000Z", "+00:00");
+    const day2End = day2Window.end.toISOString().replace(".000Z", "+00:00");
 
     const day2Busy = await queryDayAvailability(day2Start, day2End);
     const day2FreeAll = calculateFreeSlots(day2Busy, day2Window.start, day2Window.end);
@@ -665,8 +665,8 @@ async function checkDayAvailability(dayStr) {
       return { status: "closed", day: dayStr };
     }
 
-    const searchStart = window.start.toISOString().replace("Z", "+00:00");
-    const searchEnd = window.end.toISOString().replace("Z", "+00:00");
+    const searchStart = window.start.toISOString().replace(".000Z", "+00:00");
+    const searchEnd = window.end.toISOString().replace(".000Z", "+00:00");
 
     const busyPeriods = await queryDayAvailability(searchStart, searchEnd);
     const freeSlots = calculateFreeSlots(busyPeriods, window.start, window.end);
@@ -732,7 +732,7 @@ async function triggerCancel(cancelParams, patientPhone) {
     type: "cancel",
     name: cancelParams.name || "",
     phone: cancelParams.phone || patientPhone,
-    current_utc: new Date().toISOString().replace("Z", "+00:00"),
+    current_utc: new Date().toISOString().replace(".000Z", "+00:00"),
   };
 
   console.log("Triggering CANCEL webhook:", payload);
