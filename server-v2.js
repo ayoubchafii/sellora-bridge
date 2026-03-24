@@ -898,8 +898,8 @@ app.post("/webhook", async (req, res) => {
 
     const userPhone = message.from;
 
-    // ── RESET command: clear all data for testing (only from clinic owner)
-    if (message.type === "text" && message.text.body.trim().toUpperCase() === "RESET" && userPhone === CLINIC_OWNER_PHONE) {
+    // ── RESET command: clear all data for testing (clears sender's own data only)
+    if (message.type === "text" && message.text.body.trim().toUpperCase() === "RESET") {
       await resetPatientData(userPhone);
       await sendWhatsApp(userPhone, "تم مسح جميع البيانات. المحادثة تبدأ من جديد.");
       console.log(`RESET triggered by ${userPhone}`);
