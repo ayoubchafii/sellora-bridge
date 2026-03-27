@@ -2,6 +2,7 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const { BedrockRuntimeClient, ConverseCommand } = require("@aws-sdk/client-bedrock-runtime");
+const { Pool } = require("pg");
 
 const app = express();
 app.use(express.json());
@@ -19,6 +20,7 @@ const SEARCH_WEBHOOK_URL = process.env.SEARCH_WEBHOOK_URL;
 const CLINIC_OWNER_PHONE = process.env.CLINIC_OWNER_PHONE || "";
 const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL;
 
 const MODEL_ID = "global.anthropic.claude-sonnet-4-6";
 
@@ -45,6 +47,44 @@ const bedrockClient = new BedrockRuntimeClient({
     secretAccessKey: AWS_SECRET_ACCESS_KEY,
   },
 });
+
+// ══════════════════════════════════════════════════════════════
+// ── NEON POSTGRESQL — CLIENT DATABASE (Step 3)
+// ══════════════════════════════════════════════════════════════
+
+const pool = DATABASE_URL ? new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+}) : null;
+
+// ── Client cache (loaded from DB on startup, refreshed every 30 minutes)
+let clientCache = new Map();
+
+async function loadClientsFromDB() {
+  if (!pool) {
+    console.log("DATABASE_URL not set — skipping client cache load");
+    return;
+  }
+  try {
+    const result = await pool.query("SELECT * FROM clinics WHERE active = TRUE");
+    const newCache = new Map();
+    for (const row of result.rows) {
+      newCache.set(row.phone_number_id, row);
+    }
+    clientCache = newCache;
+    console.log(`Client cache loaded: ${clientCache.size} active clinic(s)`);
+  } catch (err) {
+    console.error("Failed to load client cache:", err.message);
+  }
+}
+
+function getClientByPhoneNumberId(phoneNumberId) {
+  return clientCache.get(phoneNumberId) || null;
+}
+
+// Load clients on startup + refresh every 30 minutes
+loadClientsFromDB();
+setInterval(loadClientsFromDB, 30 * 60 * 1000);
 
 // ══════════════════════════════════════════════════════════════
 // ── UPSTASH REDIS HELPERS
