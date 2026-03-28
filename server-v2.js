@@ -1088,17 +1088,42 @@ async function callClaude(userPhone, userMessage, clinicId) {
 // ── DEBUG: Check template language codes (temporary — remove after fixing)
 app.get("/debug-templates", async (req, res) => {
   try {
-    const wabaId = "2757794811265822"; // WhatsApp Business Account ID
-    const response = await axios.get(
-      `https://graph.facebook.com/v22.0/${wabaId}/message_templates`,
+    // First get the WABA ID from the phone number
+    const phoneResp = await axios.get(
+      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}`,
       {
         headers: { Authorization: `Bearer ${WA_TOKEN}` },
-        params: { limit: 10 },
+        params: { fields: "id,display_phone_number,name_status,quality_rating" },
       }
     );
-    res.json(response.data);
+    
+    // Try to get templates from the WABA
+    const wabaResp = await axios.get(
+      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/whatsapp_business_profile`,
+      {
+        headers: { Authorization: `Bearer ${WA_TOKEN}` },
+      }
+    );
+
+    res.json({ phone: phoneResp.data, profile: wabaResp.data });
   } catch (err) {
-    res.json({ error: err.response?.data || err.message });
+    // If that fails, try direct template list with different WABA IDs
+    try {
+      const bizId = "78287671101838";
+      const resp = await axios.get(
+        `https://graph.facebook.com/v22.0/${bizId}/message_templates`,
+        {
+          headers: { Authorization: `Bearer ${WA_TOKEN}` },
+          params: { limit: 10 },
+        }
+      );
+      res.json({ templates: resp.data });
+    } catch (err2) {
+      res.json({ 
+        error1: err.response?.data || err.message,
+        error2: err2.response?.data || err2.message 
+      });
+    }
   }
 });
 
