@@ -1087,44 +1087,53 @@ async function callClaude(userPhone, userMessage, clinicId) {
 
 // ── DEBUG: Check template language codes (temporary — remove after fixing)
 app.get("/debug-templates", async (req, res) => {
+  const results = {};
+  
+  // Step 1: Find WABA ID from business ID
   try {
-    // First get the WABA ID from the phone number
-    const phoneResp = await axios.get(
-      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}`,
-      {
-        headers: { Authorization: `Bearer ${WA_TOKEN}` },
-        params: { fields: "id,display_phone_number,name_status,quality_rating" },
-      }
-    );
-    
-    // Try to get templates from the WABA
+    const bizId = "78287671101838";
     const wabaResp = await axios.get(
-      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/whatsapp_business_profile`,
-      {
+      `https://graph.facebook.com/v22.0/${bizId}/owned_whatsapp_business_accounts`,
+      { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
+    );
+    results.step1_waba = wabaResp.data;
+    
+    // Step 2: If we found WABA IDs, query templates from the first one
+    const wabaIds = wabaResp.data?.data?.map(w => w.id) || [];
+    for (const wabaId of wabaIds) {
+      try {
+        const tplResp = await axios.get(
+          `https://graph.facebook.com/v22.0/${wabaId}/message_templates`,
+          { 
+            headers: { Authorization: `Bearer ${WA_TOKEN}` },
+            params: { limit: 10, fields: "name,language,status,category" }
+          }
+        );
+        results[`step2_templates_${wabaId}`] = tplResp.data;
+      } catch (tplErr) {
+        results[`step2_error_${wabaId}`] = tplErr.response?.data || tplErr.message;
+      }
+    }
+  } catch (err) {
+    results.step1_error = err.response?.data || err.message;
+  }
+
+  // Step 3: Also try the WABA ID from architecture.md
+  try {
+    const archWabaId = "2757794811265822";
+    const tplResp = await axios.get(
+      `https://graph.facebook.com/v22.0/${archWabaId}/message_templates`,
+      { 
         headers: { Authorization: `Bearer ${WA_TOKEN}` },
+        params: { limit: 10, fields: "name,language,status,category" }
       }
     );
-
-    res.json({ phone: phoneResp.data, profile: wabaResp.data });
+    results.step3_arch_waba = tplResp.data;
   } catch (err) {
-    // If that fails, try direct template list with different WABA IDs
-    try {
-      const bizId = "78287671101838";
-      const resp = await axios.get(
-        `https://graph.facebook.com/v22.0/${bizId}/message_templates`,
-        {
-          headers: { Authorization: `Bearer ${WA_TOKEN}` },
-          params: { limit: 10 },
-        }
-      );
-      res.json({ templates: resp.data });
-    } catch (err2) {
-      res.json({ 
-        error1: err.response?.data || err.message,
-        error2: err2.response?.data || err2.message 
-      });
-    }
+    results.step3_error = err.response?.data || err.message;
   }
+
+  res.json(results);
 });
 
 app.get("/webhook", (req, res) => {
