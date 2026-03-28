@@ -107,15 +107,15 @@ function getTimezoneOffsetHours(timezone) {
   }
 }
 
-// Get the current clinic's timezone string from database
-function getClinicTimezone() {
-  const clinic = getClientByPhoneNumberId(PHONE_NUMBER_ID);
+// Get the clinic's timezone string from database
+function getClinicTimezone(clinicId) {
+  const clinic = getClientByPhoneNumberId(clinicId || PHONE_NUMBER_ID);
   return clinic?.timezone || "Asia/Riyadh";
 }
 
-// Get the current clinic's UTC offset in hours
-function getClinicOffset() {
-  return getTimezoneOffsetHours(getClinicTimezone());
+// Get the clinic's UTC offset in hours
+function getClinicOffset(clinicId) {
+  return getTimezoneOffsetHours(getClinicTimezone(clinicId));
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -229,7 +229,7 @@ async function resetPatientData(phone) {
 }
 
 // ── Convert UTC datetime string to readable Arabic (dynamic clinic timezone)
-function formatTimeArabic(isoString) {
+function formatTimeArabic(isoString, clinicId) {
   try {
     const cleaned = String(isoString).trim();
     const date = new Date(cleaned);
@@ -239,7 +239,7 @@ function formatTimeArabic(isoString) {
     }
 
     // Convert UTC to clinic local time using dynamic offset
-    const offset = getClinicOffset();
+    const offset = getClinicOffset(clinicId);
     const localDate = new Date(date.getTime() + offset * 60 * 60 * 1000);
 
     const days = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
@@ -334,10 +334,11 @@ function stripAllTags(text) {
     .trim();
 }
 
-// ── Send WhatsApp message
-async function sendWhatsApp(to, message) {
+// ── Send WhatsApp message (dynamic sender phone number)
+async function sendWhatsApp(to, message, clinicId) {
+  const senderPhoneId = clinicId || PHONE_NUMBER_ID;
   await axios.post(
-    `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+    `https://graph.facebook.com/v22.0/${senderPhoneId}/messages`,
     {
       messaging_product: "whatsapp",
       to,
@@ -353,10 +354,14 @@ async function sendWhatsApp(to, message) {
   );
 }
 
-// ── Send clinic owner notification
-async function notifyClinicOwner(type, details) {
-  if (!CLINIC_OWNER_PHONE) {
-    console.log("No CLINIC_OWNER_PHONE set, skipping notification");
+// ── Send clinic owner notification (dynamic per clinic)
+async function notifyClinicOwner(type, details, clinicId) {
+  // Get notification phone from database, fallback to env var
+  const clinicData = getClientByPhoneNumberId(clinicId);
+  const notificationPhone = clinicData?.notification_phone || CLINIC_OWNER_PHONE;
+
+  if (!notificationPhone) {
+    console.log("No notification phone set, skipping notification");
     return;
   }
 
@@ -373,7 +378,7 @@ async function notifyClinicOwner(type, details) {
   if (!message) return;
 
   try {
-    await sendWhatsApp(CLINIC_OWNER_PHONE, message);
+    await sendWhatsApp(notificationPhone, message, clinicId);
     console.log(`Clinic owner notified: ${type}`);
   } catch (err) {
     console.error("Clinic notification error:", err.message);
@@ -385,14 +390,14 @@ async function notifyClinicOwner(type, details) {
 // ══════════════════════════════════════════════════════════════
 
 // ── Call Make.com search-availability webhook to get busy times for a day
-async function queryDayAvailability(searchStart, searchEnd) {
+async function queryDayAvailability(searchStart, searchEnd, clinicId) {
   if (!SEARCH_WEBHOOK_URL) {
     console.error("SEARCH_WEBHOOK_URL not set");
     return [];
   }
 
   // Get calendar ID from database
-  const clinicData = getClientByPhoneNumberId(PHONE_NUMBER_ID);
+  const clinicData = getClientByPhoneNumberId(clinicId);
 
   const payload = {
     type: "search",
@@ -473,12 +478,12 @@ function calculateFreeSlots(busyPeriods, windowStartUTC, windowEndUTC) {
 }
 
 // ── Get working hours window (UTC) for a given date — dynamic timezone
-function getWorkingWindow(date) {
+function getWorkingWindow(date, clinicId) {
   const d = new Date(date);
   const year = d.getUTCFullYear();
   const month = d.getUTCMonth();
   const day = d.getUTCDate();
-  const offset = getClinicOffset();
+  const offset = getClinicOffset(clinicId);
 
   // Convert local working hours to UTC by subtracting offset
   const startUTC = WORKING_HOURS_LOCAL_START - offset;
@@ -491,12 +496,12 @@ function getWorkingWindow(date) {
 }
 
 // ── Get next working day (skip Sunday — clinic is Mon-Sat) — dynamic timezone
-function getNextWorkingDay(date) {
+function getNextWorkingDay(date, clinicId) {
   const d = new Date(date);
   d.setUTCDate(d.getUTCDate() + 1);
 
   // Use clinic timezone to determine the local day
-  const offset = getClinicOffset();
+  const offset = getClinicOffset(clinicId);
   const localDate = new Date(d.getTime() + offset * 60 * 60 * 1000);
   if (localDate.getUTCDay() === 0) {
     // Local Sunday — skip to Monday
@@ -526,7 +531,7 @@ function pickClosestSlot(freeSlots, requestedTime) {
 }
 
 // ── THE WATERFALL: Find alternative time (5-step search)
-async function findAlternative(utcStart) {
+async function findAlternative(utcStart, clinicId) {
   try {
     const requested = new Date(utcStart);
     if (isNaN(requested.getTime())) {
@@ -537,11 +542,11 @@ async function findAlternative(utcStart) {
     console.log(`WATERFALL: Starting search for alternative to ${utcStart}`);
 
     // ── DAY 1 (same day as requested) ──
-    const day1Window = getWorkingWindow(requested);
+    const day1Window = getWorkingWindow(requested, clinicId);
     const day1Start = day1Window.start.toISOString().replace(".000Z", "+00:00");
     const day1End = day1Window.end.toISOString().replace(".000Z", "+00:00");
 
-    const day1Busy = await queryDayAvailability(day1Start, day1End);
+    const day1Busy = await queryDayAvailability(day1Start, day1End, clinicId);
     const day1FreeAll = calculateFreeSlots(day1Busy, day1Window.start, day1Window.end);
 
     // Step 1: ±2h from requested, clamped to working hours
@@ -567,12 +572,12 @@ async function findAlternative(utcStart) {
     }
 
     // ── DAY 2 (next working day) ──
-    const day2Date = getNextWorkingDay(requested);
-    const day2Window = getWorkingWindow(day2Date);
+    const day2Date = getNextWorkingDay(requested, clinicId);
+    const day2Window = getWorkingWindow(day2Date, clinicId);
     const day2Start = day2Window.start.toISOString().replace(".000Z", "+00:00");
     const day2End = day2Window.end.toISOString().replace(".000Z", "+00:00");
 
-    const day2Busy = await queryDayAvailability(day2Start, day2End);
+    const day2Busy = await queryDayAvailability(day2Start, day2End, clinicId);
     const day2FreeAll = calculateFreeSlots(day2Busy, day2Window.start, day2Window.end);
 
     // Step 3: Exact same time on Day 2
@@ -643,10 +648,10 @@ async function isRaceCondition(userPhone, failedUtcStart) {
 }
 
 // ── Resolve day name/word to a UTC date — dynamic timezone
-function resolveDay(dayStr) {
+function resolveDay(dayStr, clinicId) {
   const now = new Date();
   // Current local date using clinic timezone
-  const offset = getClinicOffset();
+  const offset = getClinicOffset(clinicId);
   const localNow = new Date(now.getTime() + offset * 60 * 60 * 1000);
   const localToday = new Date(Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), localNow.getUTCDate()));
 
@@ -700,12 +705,12 @@ function resolveDay(dayStr) {
 }
 
 // ── Select 3-4 well-spread slots across morning, midday, afternoon — dynamic timezone
-function selectSpreadSlots(freeSlots) {
+function selectSpreadSlots(freeSlots, clinicId) {
   if (freeSlots.length === 0) return [];
   if (freeSlots.length <= 4) return freeSlots;
 
   // Split into time windows using dynamic clinic timezone
-  const offset = getClinicOffset();
+  const offset = getClinicOffset(clinicId);
   // Morning: 9AM-12PM local → (9-offset) to (12-offset) UTC
   // Midday: 12PM-3PM local → (12-offset) to (15-offset) UTC
   // Afternoon: 3PM-6PM local → (15-offset) to (18-offset) UTC
@@ -742,13 +747,13 @@ function selectSpreadSlots(freeSlots) {
 }
 
 // ── Check availability for a given day — returns formatted slot list
-async function checkDayAvailability(dayStr) {
+async function checkDayAvailability(dayStr, clinicId) {
   try {
-    const targetDate = resolveDay(dayStr);
-    const window = getWorkingWindow(targetDate);
+    const targetDate = resolveDay(dayStr, clinicId);
+    const window = getWorkingWindow(targetDate, clinicId);
 
     // Check if target day is Sunday (clinic local time) — clinic closed
-    const offset = getClinicOffset();
+    const offset = getClinicOffset(clinicId);
     const localDate = new Date(targetDate.getTime() + offset * 60 * 60 * 1000);
     if (localDate.getUTCDay() === 0) {
       return { status: "closed", day: dayStr };
@@ -757,15 +762,15 @@ async function checkDayAvailability(dayStr) {
     const searchStart = window.start.toISOString().replace(".000Z", "+00:00");
     const searchEnd = window.end.toISOString().replace(".000Z", "+00:00");
 
-    const busyPeriods = await queryDayAvailability(searchStart, searchEnd);
+    const busyPeriods = await queryDayAvailability(searchStart, searchEnd, clinicId);
     const freeSlots = calculateFreeSlots(busyPeriods, window.start, window.end);
 
     if (freeSlots.length === 0) {
       return { status: "fully_booked", day: dayStr };
     }
 
-    const selected = selectSpreadSlots(freeSlots);
-    const formatted = selected.map(s => formatTimeArabic(s.toISOString()));
+    const selected = selectSpreadSlots(freeSlots, clinicId);
+    const formatted = selected.map(s => formatTimeArabic(s.toISOString(), clinicId));
 
     return { status: "availability", slots: formatted, day: dayStr, total_free: freeSlots.length };
   } catch (err) {
@@ -779,14 +784,14 @@ async function checkDayAvailability(dayStr) {
 // ══════════════════════════════════════════════════════════════
 
 // ── Call Make.com BOOKING webhook and WAIT for JSON response
-async function triggerBooking(bookingParams, patientPhone) {
+async function triggerBooking(bookingParams, patientPhone, clinicId) {
   if (!MAKE_WEBHOOK_URL) {
     console.error("MAKE_WEBHOOK_URL not set");
     return { status: "error" };
   }
 
   // Get calendar IDs from database
-  const clinicData = getClientByPhoneNumberId(PHONE_NUMBER_ID);
+  const clinicData = getClientByPhoneNumberId(clinicId);
 
   const payload = {
     name: bookingParams.name || "",
@@ -816,14 +821,14 @@ async function triggerBooking(bookingParams, patientPhone) {
 }
 
 // ── Call Make.com CANCEL webhook and WAIT for JSON response
-async function triggerCancel(cancelParams, patientPhone) {
+async function triggerCancel(cancelParams, patientPhone, clinicId) {
   if (!CANCEL_WEBHOOK_URL) {
     console.error("CANCEL_WEBHOOK_URL not set");
     return { status: "error" };
   }
 
   // Get calendar ID from database
-  const clinicData = getClientByPhoneNumberId(PHONE_NUMBER_ID);
+  const clinicData = getClientByPhoneNumberId(clinicId);
 
   const payload = {
     type: "cancel",
@@ -850,7 +855,7 @@ async function triggerCancel(cancelParams, patientPhone) {
 }
 
 // ── Handle RESCHEDULE: cancel old → book new → if fail → re-book old
-async function triggerReschedule(rescheduleParams, patientPhone) {
+async function triggerReschedule(rescheduleParams, patientPhone, clinicId) {
 
   // Step 1: Cancel the old appointment first
   console.log("RESCHEDULE Step 1: Cancelling old appointment...");
@@ -858,7 +863,7 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
     name: rescheduleParams.name || "",
     phone: rescheduleParams.phone || patientPhone,
   };
-  const cancelResult = await triggerCancel(cancelParams, patientPhone);
+  const cancelResult = await triggerCancel(cancelParams, patientPhone, clinicId);
 
   // If no appointment found, stop
   if (cancelResult.status === "not_found") {
@@ -875,7 +880,7 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
   // Save old event details for potential re-booking
   const oldTimeRaw = cancelResult.old_time || "";
   const oldService = cancelResult.old_service || "appointment";
-  const oldTimeArabic = formatTimeArabic(oldTimeRaw);
+  const oldTimeArabic = formatTimeArabic(oldTimeRaw, clinicId);
   console.log(`Old appointment saved: raw=${oldTimeRaw}, arabic=${oldTimeArabic}, service=${oldService}`);
 
   // Step 2: Book the new time
@@ -886,7 +891,7 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
     time: rescheduleParams.new_time || "",
     service: rescheduleParams.service || oldService,
   };
-  const bookResult = await triggerBooking(bookingParams, patientPhone);
+  const bookResult = await triggerBooking(bookingParams, patientPhone, clinicId);
 
   // If new time booked successfully, done!
   if (bookResult.status === "booked") {
@@ -908,14 +913,14 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
     time: oldTimeRaw,
     service: rescheduleParams.service || oldService,
   };
-  const rebookResult = await triggerBooking(rebookParams, patientPhone);
+  const rebookResult = await triggerBooking(rebookParams, patientPhone, clinicId);
   console.log(`Re-book old time result: ${rebookResult.status}`);
 
   // Run waterfall to find alternative for the failed reschedule
   if (bookResult.status === "busy" && bookResult.utc_start) {
-    const alternative = await findAlternative(bookResult.utc_start);
+    const alternative = await findAlternative(bookResult.utc_start, clinicId);
     if (alternative) {
-      const altArabic = formatTimeArabic(alternative.utc.toISOString());
+      const altArabic = formatTimeArabic(alternative.utc.toISOString(), clinicId);
       return {
         status: "reschedule_failed_busy",
         alternative: altArabic,
@@ -934,7 +939,7 @@ async function triggerReschedule(rescheduleParams, patientPhone) {
 }
 
 // ── Call Claude via AWS Bedrock
-async function callClaude(userPhone, userMessage) {
+async function callClaude(userPhone, userMessage, clinicId) {
   await addToHistory(userPhone, "user", userMessage);
 
   const history = await getHistory(userPhone);
@@ -943,7 +948,7 @@ async function callClaude(userPhone, userMessage) {
   let dynamicPrompt = SARA_BASE_PROMPT;
 
   // Inject clinic data from database
-  const clinicData = getClientByPhoneNumberId(PHONE_NUMBER_ID);
+  const clinicData = getClientByPhoneNumberId(clinicId);
   if (clinicData) {
     dynamicPrompt += `\n\nمعلومات العيادة:`;
     dynamicPrompt += `\n- الاسم: ${clinicData.clinic_name_ar}`;
@@ -1053,10 +1058,13 @@ app.post("/webhook", async (req, res) => {
 
     const userPhone = message.from;
 
+    // ── MULTI-TENANT: Use incoming phone_number_id to identify the clinic
+    const clinicId = incomingPhoneNumberId || PHONE_NUMBER_ID;
+
     // ── RESET command: clear all data for testing (clears sender's own data only)
     if (message.type === "text" && message.text.body.trim().toUpperCase() === "RESET") {
       await resetPatientData(userPhone);
-      await sendWhatsApp(userPhone, "تم مسح جميع البيانات. المحادثة تبدأ من جديد.");
+      await sendWhatsApp(userPhone, "تم مسح جميع البيانات. المحادثة تبدأ من جديد.", clinicId);
       console.log(`RESET triggered by ${userPhone}`);
       return;
     }
@@ -1067,10 +1075,10 @@ app.post("/webhook", async (req, res) => {
     // ── Handle voice/audio messages: tell Sara, let her respond naturally
     if (message.type === "audio") {
       console.log(`Voice message from ${userPhone}`);
-      const saraResponse = await callClaude(userPhone, "[المريض أرسل رسالة صوتية. لا تستطيع سماعها. اطلب منه بلطف أن يكتب رسالته.]");
+      const saraResponse = await callClaude(userPhone, "[المريض أرسل رسالة صوتية. لا تستطيع سماعها. اطلب منه بلطف أن يكتب رسالته.]", clinicId);
       const cleanResponse = stripAllTags(saraResponse);
       if (cleanResponse) {
-        await sendWhatsApp(userPhone, cleanResponse);
+        await sendWhatsApp(userPhone, cleanResponse, clinicId);
         console.log(`Replied to voice from ${userPhone}: ${cleanResponse}`);
       }
       return;
@@ -1079,7 +1087,7 @@ app.post("/webhook", async (req, res) => {
     // ── Handle image/video/document/sticker/location/contacts: hardcoded reply
     if (["image", "video", "document", "sticker", "location", "contacts"].includes(message.type)) {
       console.log(`Non-text message (${message.type}) from ${userPhone}`);
-      await sendWhatsApp(userPhone, "عذراً، أقدر أساعدك بالرسائل النصية فقط حالياً. ممكن تكتب لي رسالتك؟");
+      await sendWhatsApp(userPhone, "عذراً، أقدر أساعدك بالرسائل النصية فقط حالياً. ممكن تكتب لي رسالتك؟", clinicId);
       return;
     }
 
@@ -1108,7 +1116,7 @@ app.post("/webhook", async (req, res) => {
       console.log(`Debounced message from ${userPhone}: ${combinedText}`);
 
       try {
-        await processTextMessage(userPhone, combinedText);
+        await processTextMessage(userPhone, combinedText, clinicId);
       } catch (err) {
         console.error("Process error:", err.response?.data || err.message);
       }
@@ -1120,10 +1128,10 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ── Process debounced text message through Sara
-async function processTextMessage(userPhone, userText) {
+async function processTextMessage(userPhone, userText, clinicId) {
   try {
     // ── First call: Sara responds to the patient's message
-    const saraResponse = await callClaude(userPhone, userText);
+    const saraResponse = await callClaude(userPhone, userText, clinicId);
     console.log(`Sara raw response: ${saraResponse}`);
 
     // ── Check which tag Sara included
@@ -1135,7 +1143,7 @@ async function processTextMessage(userPhone, userText) {
     if (bookingParams) {
       // ── BOOKING FLOW
       console.log("Booking detected:", bookingParams);
-      const makeResult = await triggerBooking(bookingParams, userPhone);
+      const makeResult = await triggerBooking(bookingParams, userPhone, clinicId);
       console.log("Calendar result:", makeResult);
 
       let resultToInject;
@@ -1144,9 +1152,9 @@ async function processTextMessage(userPhone, userText) {
         // ── PHASE 3: Run waterfall search for alternative
         const retry = await isRaceCondition(userPhone, makeResult.utc_start || "");
 
-        const alternative = await findAlternative(makeResult.utc_start || "");
+        const alternative = await findAlternative(makeResult.utc_start || "", clinicId);
         if (alternative) {
-          const altArabic = formatTimeArabic(alternative.utc.toISOString());
+          const altArabic = formatTimeArabic(alternative.utc.toISOString(), clinicId);
           // Store suggestion for race condition detection on next attempt
           await setLastSuggested(userPhone, alternative.utc.getTime());
           resultToInject = {
@@ -1173,11 +1181,11 @@ async function processTextMessage(userPhone, userText) {
       }
 
       const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(resultToInject)}]`;
-      const finalResponse = await callClaude(userPhone, resultMessage);
+      const finalResponse = await callClaude(userPhone, resultMessage, clinicId);
       const cleanFinal = stripAllTags(finalResponse);
       if (!cleanFinal) return;
 
-      await sendWhatsApp(userPhone, cleanFinal);
+      await sendWhatsApp(userPhone, cleanFinal, clinicId);
       console.log(`Replied to ${userPhone}: ${cleanFinal}`);
 
       // Notify clinic owner for successful bookings only
@@ -1190,21 +1198,21 @@ async function processTextMessage(userPhone, userText) {
           phone: bookingParams.phone || userPhone,
           service: bookingParams.service || "free consultation",
           time: bookingParams.time,
-        });
+        }, clinicId);
       }
 
     } else if (cancelParams) {
       // ── CANCEL FLOW (unchanged)
       console.log("Cancel detected:", cancelParams);
-      const cancelResult = await triggerCancel(cancelParams, userPhone);
+      const cancelResult = await triggerCancel(cancelParams, userPhone, clinicId);
       console.log("Cancel result:", cancelResult);
 
       const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(cancelResult)}]`;
-      const finalResponse = await callClaude(userPhone, resultMessage);
+      const finalResponse = await callClaude(userPhone, resultMessage, clinicId);
       const cleanFinal = stripAllTags(finalResponse);
       if (!cleanFinal) return;
 
-      await sendWhatsApp(userPhone, cleanFinal);
+      await sendWhatsApp(userPhone, cleanFinal, clinicId);
       console.log(`Replied to ${userPhone}: ${cleanFinal}`);
 
       // Notify clinic owner for successful cancellations only
@@ -1212,21 +1220,21 @@ async function processTextMessage(userPhone, userText) {
         await notifyClinicOwner("cancelled", {
           name: cancelParams.name,
           phone: cancelParams.phone || userPhone,
-        });
+        }, clinicId);
       }
 
     } else if (rescheduleParams) {
       // ── RESCHEDULE FLOW (with alternatives for failed reschedules)
       console.log("Reschedule detected:", rescheduleParams);
-      const rescheduleResult = await triggerReschedule(rescheduleParams, userPhone);
+      const rescheduleResult = await triggerReschedule(rescheduleParams, userPhone, clinicId);
       console.log("Reschedule result:", rescheduleResult);
 
       const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(rescheduleResult)}]`;
-      const finalResponse = await callClaude(userPhone, resultMessage);
+      const finalResponse = await callClaude(userPhone, resultMessage, clinicId);
       const cleanFinal = stripAllTags(finalResponse);
       if (!cleanFinal) return;
 
-      await sendWhatsApp(userPhone, cleanFinal);
+      await sendWhatsApp(userPhone, cleanFinal, clinicId);
       console.log(`Replied to ${userPhone}: ${cleanFinal}`);
 
       // Notify clinic owner for successful reschedules only — NOT for failed re-books
@@ -1237,22 +1245,22 @@ async function processTextMessage(userPhone, userText) {
           service: rescheduleParams.service || rescheduleResult.service,
           old_time: rescheduleResult.old_time,
           new_time: rescheduleParams.new_time,
-        });
+        }, clinicId);
       }
       // Failed reschedule (re-book) → NO notification. Nothing changed for the clinic.
 
     } else if (checkAvailParams) {
       // ── CHECK AVAILABILITY FLOW
       console.log("Availability check detected:", checkAvailParams);
-      const availResult = await checkDayAvailability(checkAvailParams.day || "tomorrow");
+      const availResult = await checkDayAvailability(checkAvailParams.day || "tomorrow", clinicId);
       console.log("Availability result:", availResult);
 
       const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(availResult)}]`;
-      const finalResponse = await callClaude(userPhone, resultMessage);
+      const finalResponse = await callClaude(userPhone, resultMessage, clinicId);
       const cleanFinal = stripAllTags(finalResponse);
       if (!cleanFinal) return;
 
-      await sendWhatsApp(userPhone, cleanFinal);
+      await sendWhatsApp(userPhone, cleanFinal, clinicId);
       console.log(`Replied to ${userPhone}: ${cleanFinal}`);
 
     } else {
@@ -1260,7 +1268,7 @@ async function processTextMessage(userPhone, userText) {
       const cleanResponse = stripAllTags(saraResponse);
       if (!cleanResponse) return;
 
-      await sendWhatsApp(userPhone, cleanResponse);
+      await sendWhatsApp(userPhone, cleanResponse, clinicId);
       console.log(`Replied to ${userPhone}: ${cleanResponse}`);
     }
 
