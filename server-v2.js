@@ -1085,44 +1085,60 @@ async function callClaude(userPhone, userMessage, clinicId) {
 
 // ── STEP 1: Meta webhook verification (GET)
 
-// ── DEBUG: Check template language codes (temporary — remove after fixing)
+// ── DEBUG: Test template (temporary — remove after confirming)
 app.get("/debug-templates", async (req, res) => {
   const results = {};
   
-  // Test: Send actual template to actual notification phone using PHONE_NUMBER_ID
+  // Test 1: Try hello_world (pre-built, should work on test numbers)
   try {
-    const notifPhone = "212688619309";
-    const payload = {
-      messaging_product: "whatsapp",
-      to: notifPhone,
-      type: "template",
-      template: {
-        name: "new_booking",
-        language: { code: "ar" },
-        components: [{
-          type: "body",
-          parameters: [
-            { type: "text", text: "تجربة" },
-            { type: "text", text: "0501234567" },
-            { type: "text", text: "تنظيف الأسنان" },
-            { type: "text", text: "الاثنين الساعة 3 مساءً" },
-          ]
-        }]
-      }
-    };
-    results.payload = payload;
-    results.sender_phone_id = PHONE_NUMBER_ID;
-    
     const resp = await axios.post(
       `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
-      payload,
+      {
+        messaging_product: "whatsapp",
+        to: "212688619309",
+        type: "template",
+        template: {
+          name: "hello_world",
+          language: { code: "en_US" },
+        }
+      },
       { headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" } }
     );
-    results.success = resp.data;
+    results.hello_world = { status: "SUCCESS", data: resp.data };
   } catch (err) {
-    results.error = err.response?.data || err.message;
+    results.hello_world = { status: "FAILED", error: err.response?.data || err.message };
   }
 
+  // Test 2: Try custom template (should fail on test numbers)
+  try {
+    const resp = await axios.post(
+      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to: "212688619309",
+        type: "template",
+        template: {
+          name: "new_booking",
+          language: { code: "ar" },
+          components: [{
+            type: "body",
+            parameters: [
+              { type: "text", text: "test" },
+              { type: "text", text: "test" },
+              { type: "text", text: "test" },
+              { type: "text", text: "test" },
+            ]
+          }]
+        }
+      },
+      { headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" } }
+    );
+    results.new_booking = { status: "SUCCESS", data: resp.data };
+  } catch (err) {
+    results.new_booking = { status: "FAILED", error: err.response?.data || err.message };
+  }
+
+  results.conclusion = "If hello_world works but new_booking fails, the issue is Meta test number restrictions — custom templates only work on real WhatsApp Business numbers.";
   res.json(results);
 });
 
