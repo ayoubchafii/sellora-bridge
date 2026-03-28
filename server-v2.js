@@ -35,9 +35,9 @@ const PATIENT_EXPIRY_NORMAL = 7 * 24 * 60 * 60;      // 7 days for new patients
 const PATIENT_EXPIRY_LOYAL = 90 * 24 * 60 * 60;      // 90 days for loyal patients (3+ bookings)
 const LOYAL_BOOKING_THRESHOLD = 3;
 
-// ── Load Sara's prompt from external file
-const SARA_SYSTEM_PROMPT = fs.readFileSync("sara_prompt.txt", "utf8");
-console.log("Sara prompt loaded successfully.");
+// ── Load Sara's base prompt from external file (universal rules, no clinic data)
+const SARA_BASE_PROMPT = fs.readFileSync("sara_prompt_base.txt", "utf8");
+console.log("Sara base prompt loaded successfully.");
 
 // ── AWS Bedrock client
 const bedrockClient = new BedrockRuntimeClient({
@@ -881,8 +881,31 @@ async function callClaude(userPhone, userMessage) {
 
   const history = await getHistory(userPhone);
 
-  // Inject patient's WhatsApp number and profile into system prompt
-  let dynamicPrompt = SARA_SYSTEM_PROMPT + `\n\nرقم واتساب المريض الحالي: ${userPhone}`;
+  // Build dynamic prompt: base rules + clinic data from DB + patient info
+  let dynamicPrompt = SARA_BASE_PROMPT;
+
+  // Inject clinic data from database
+  const clinicData = getClientByPhoneNumberId(PHONE_NUMBER_ID);
+  if (clinicData) {
+    dynamicPrompt += `\n\nمعلومات العيادة:`;
+    dynamicPrompt += `\n- الاسم: ${clinicData.clinic_name_ar}`;
+    if (clinicData.location) dynamicPrompt += `\n- الموقع: ${clinicData.location}`;
+    if (clinicData.doctors) dynamicPrompt += `\n- الأطباء: ${clinicData.doctors}`;
+    if (clinicData.knowledge_base) dynamicPrompt += `\n${clinicData.knowledge_base}`;
+    if (clinicData.languages) {
+      const langMap = { ar: "العربية", en: "الإنجليزية", fr: "الفرنسية" };
+      const langNames = clinicData.languages.split(",").map(l => langMap[l.trim()] || l.trim()).join(" و");
+      dynamicPrompt += `\n- اللغات: ${langNames} فقط. أي لغة أخرى → رد بالعربية.`;
+    }
+
+    // Priority override — injected LAST, overrides everything
+    if (clinicData.priority_override) {
+      dynamicPrompt += `\n\nتحديثات مهمة (لها الأولوية المطلقة على أي معلومات أخرى):\n${clinicData.priority_override}`;
+    }
+  }
+
+  // Inject patient's WhatsApp number
+  dynamicPrompt += `\n\nرقم واتساب المريض الحالي: ${userPhone}`;
 
   // Check if we know this patient
   const profile = await getPatientProfile(userPhone);
