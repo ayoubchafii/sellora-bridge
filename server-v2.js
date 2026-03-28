@@ -354,34 +354,95 @@ async function sendWhatsApp(to, message, clinicId) {
   );
 }
 
-// ── Send clinic owner notification (dynamic per clinic)
+// ── Send clinic owner notification via WhatsApp TEMPLATE messages (no 24-hour restriction)
 async function notifyClinicOwner(type, details, clinicId) {
   // Get notification phone from database, fallback to env var
   const clinicData = getClientByPhoneNumberId(clinicId);
   const notificationPhone = clinicData?.notification_phone || CLINIC_OWNER_PHONE;
+  const senderPhoneId = clinicId || PHONE_NUMBER_ID;
 
   if (!notificationPhone) {
     console.log("No notification phone set, skipping notification");
     return;
   }
 
-  let message = "";
+  let templateName = "";
+  let components = [];
 
   if (type === "new_booking") {
-    message = `موعد جديد:\nالاسم: ${details.name}\nالهاتف: ${details.phone}\nالخدمة: ${details.service}\nالوقت: ${details.time}`;
+    templateName = "new_booking";
+    components = [{
+      type: "body",
+      parameters: [
+        { type: "text", text: details.name || "" },
+        { type: "text", text: details.phone || "" },
+        { type: "text", text: details.service || "" },
+        { type: "text", text: details.time || "" },
+      ]
+    }];
   } else if (type === "cancelled") {
-    message = `تم إلغاء موعد:\nالاسم: ${details.name}\nالهاتف: ${details.phone}`;
+    templateName = "appointment_cancelled";
+    components = [{
+      type: "body",
+      parameters: [
+        { type: "text", text: details.name || "" },
+        { type: "text", text: details.phone || "" },
+      ]
+    }];
   } else if (type === "rescheduled") {
-    message = `تم تغيير موعد:\nالاسم: ${details.name}\nالهاتف: ${details.phone}\nالخدمة: ${details.service}\nمن: ${details.old_time}\nإلى: ${details.new_time}`;
+    templateName = "appointment_rescheduled";
+    components = [{
+      type: "body",
+      parameters: [
+        { type: "text", text: details.name || "" },
+        { type: "text", text: details.phone || "" },
+        { type: "text", text: details.service || "" },
+        { type: "text", text: details.old_time || "" },
+        { type: "text", text: details.new_time || "" },
+      ]
+    }];
   }
 
-  if (!message) return;
+  if (!templateName) return;
 
   try {
-    await sendWhatsApp(notificationPhone, message, clinicId);
-    console.log(`Clinic owner notified: ${type}`);
+    await axios.post(
+      `https://graph.facebook.com/v22.0/${senderPhoneId}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to: notificationPhone,
+        type: "template",
+        template: {
+          name: templateName,
+          language: { code: "ar" },
+          components: components,
+        },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${WA_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    console.log(`Clinic owner notified via template: ${type}`);
   } catch (err) {
-    console.error("Clinic notification error:", err.message);
+    // Fallback to regular text message if template fails
+    console.error("Template notification error:", err.response?.data || err.message);
+    console.log("Falling back to regular text message...");
+    try {
+      let fallbackMsg = "";
+      if (type === "new_booking") {
+        fallbackMsg = `موعد جديد:\nالاسم: ${details.name}\nالهاتف: ${details.phone}\nالخدمة: ${details.service}\nالوقت: ${details.time}`;
+      } else if (type === "cancelled") {
+        fallbackMsg = `تم إلغاء موعد:\nالاسم: ${details.name}\nالهاتف: ${details.phone}`;
+      } else if (type === "rescheduled") {
+        fallbackMsg = `تم تغيير موعد:\nالاسم: ${details.name}\nالهاتف: ${details.phone}\nالخدمة: ${details.service}\nمن: ${details.old_time}\nإلى: ${details.new_time}`;
+      }
+      if (fallbackMsg) await sendWhatsApp(notificationPhone, fallbackMsg, clinicId);
+    } catch (fallbackErr) {
+      console.error("Fallback notification also failed:", fallbackErr.message);
+    }
   }
 }
 
