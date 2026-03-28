@@ -443,9 +443,12 @@ async function notifyClinicOwner(type, details, clinicId) {
       } else if (type === "rescheduled") {
         fallbackMsg = `تم تغيير موعد:\nالاسم: ${details.name}\nالهاتف: ${details.phone}\nالخدمة: ${details.service}\nمن: ${details.old_time}\nإلى: ${details.new_time}`;
       }
-      if (fallbackMsg) await sendWhatsApp(notificationPhone, fallbackMsg, clinicId);
+      if (fallbackMsg) {
+        await sendWhatsApp(notificationPhone, fallbackMsg, clinicId);
+        console.log("Fallback text notification sent successfully");
+      }
     } catch (fallbackErr) {
-      console.error("Fallback notification also failed:", fallbackErr.message);
+      console.error("Fallback notification also failed:", fallbackErr.response?.data || fallbackErr.message);
     }
   }
 }
