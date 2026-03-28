@@ -1085,62 +1085,10 @@ async function callClaude(userPhone, userMessage, clinicId) {
 
 // ── STEP 1: Meta webhook verification (GET)
 
-// ── DEBUG: Test template (temporary — remove after confirming)
-app.get("/debug-templates", async (req, res) => {
-  const results = {};
-  
-  // Test 1: Try hello_world (pre-built, should work on test numbers)
-  try {
-    const resp = await axios.post(
-      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
-      {
-        messaging_product: "whatsapp",
-        to: "212688619309",
-        type: "template",
-        template: {
-          name: "hello_world",
-          language: { code: "en_US" },
-        }
-      },
-      { headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" } }
-    );
-    results.hello_world = { status: "SUCCESS", data: resp.data };
-  } catch (err) {
-    results.hello_world = { status: "FAILED", error: err.response?.data || err.message };
-  }
-
-  // Test 2: Try custom template (should fail on test numbers)
-  try {
-    const resp = await axios.post(
-      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
-      {
-        messaging_product: "whatsapp",
-        to: "212688619309",
-        type: "template",
-        template: {
-          name: "new_booking",
-          language: { code: "ar" },
-          components: [{
-            type: "body",
-            parameters: [
-              { type: "text", text: "test" },
-              { type: "text", text: "test" },
-              { type: "text", text: "test" },
-              { type: "text", text: "test" },
-            ]
-          }]
-        }
-      },
-      { headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" } }
-    );
-    results.new_booking = { status: "SUCCESS", data: resp.data };
-  } catch (err) {
-    results.new_booking = { status: "FAILED", error: err.response?.data || err.message };
-  }
-
-  results.conclusion = "If hello_world works but new_booking fails, the issue is Meta test number restrictions — custom templates only work on real WhatsApp Business numbers.";
-  res.json(results);
-});
+// ── NOTE: Template messages (new_booking, appointment_cancelled, appointment_rescheduled)
+// are registered and approved in Meta. They will work when using a real WhatsApp Business
+// number (via 360dialog). Meta test numbers (+1 555-xxx) cannot send custom templates.
+// The notifyClinicOwner() function has a fallback to regular text messages for test numbers.
 
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
