@@ -472,7 +472,7 @@ async function queryDayAvailability(searchStart, searchEnd, clinicId) {
   try {
     const response = await axios.post(SEARCH_WEBHOOK_URL, payload, {
       headers: { "Content-Type": "application/json" },
-      timeout: 15000,
+      timeout: 30000,
     });
 
     const busyTimesStr = response.data?.busy_times || "";
@@ -870,7 +870,7 @@ async function triggerBooking(bookingParams, patientPhone, clinicId) {
   try {
     const response = await axios.post(MAKE_WEBHOOK_URL, payload, {
       headers: { "Content-Type": "application/json" },
-      timeout: 15000,
+      timeout: 30000,
     });
 
     console.log("Booking response:", response.data);
@@ -904,7 +904,7 @@ async function triggerCancel(cancelParams, patientPhone, clinicId) {
   try {
     const response = await axios.post(CANCEL_WEBHOOK_URL, payload, {
       headers: { "Content-Type": "application/json" },
-      timeout: 15000,
+      timeout: 30000,
     });
 
     console.log("Cancel response:", response.data);
