@@ -24,9 +24,9 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 const MODEL_ID = "global.anthropic.claude-sonnet-4-6";
 
-// ── Clinic working hours in UTC (Gulf 9AM-6PM = UTC 6AM-3PM)
-const WORKING_HOURS_START_UTC = 6;  // 9AM Gulf
-const WORKING_HOURS_END_UTC = 15;   // 6PM Gulf
+// ── Clinic working hours (local time — converted to UTC dynamically per clinic)
+const WORKING_HOURS_LOCAL_START = 9;  // 9AM clinic local time
+const WORKING_HOURS_LOCAL_END = 18;   // 6PM clinic local time
 const SLOT_DURATION_MIN = 30;
 
 // ── Expiry times
@@ -88,6 +88,35 @@ setInterval(loadClientsFromDB, 30 * 60 * 1000);
 
 // ── Message debouncer (3-second buffer for rapid WhatsApp messages)
 const messageBuffers = new Map(); // phone → {texts: [], timer: null}
+
+// ══════════════════════════════════════════════════════════════
+// ── TIMEZONE HELPERS (dynamic per clinic from database)
+// ══════════════════════════════════════════════════════════════
+
+// Get UTC offset in hours for a given IANA timezone (e.g., "Asia/Dubai" → 4, "Asia/Riyadh" → 3)
+function getTimezoneOffsetHours(timezone) {
+  try {
+    const now = new Date();
+    const utcStr = now.toLocaleString("en-US", { timeZone: "UTC" });
+    const tzStr = now.toLocaleString("en-US", { timeZone: timezone });
+    const diff = (new Date(tzStr) - new Date(utcStr)) / (60 * 60 * 1000);
+    return Math.round(diff);
+  } catch (err) {
+    console.error(`Invalid timezone "${timezone}", defaulting to UTC+3`);
+    return 3;
+  }
+}
+
+// Get the current clinic's timezone string from database
+function getClinicTimezone() {
+  const clinic = getClientByPhoneNumberId(PHONE_NUMBER_ID);
+  return clinic?.timezone || "Asia/Riyadh";
+}
+
+// Get the current clinic's UTC offset in hours
+function getClinicOffset() {
+  return getTimezoneOffsetHours(getClinicTimezone());
+}
 
 // ══════════════════════════════════════════════════════════════
 // ── UPSTASH REDIS HELPERS
@@ -199,7 +228,7 @@ async function resetPatientData(phone) {
   console.log(`RESET: Cleared all data for ${phone}`);
 }
 
-// ── Convert UTC datetime string to readable Arabic (Gulf time UTC+3)
+// ── Convert UTC datetime string to readable Arabic (dynamic clinic timezone)
 function formatTimeArabic(isoString) {
   try {
     const cleaned = String(isoString).trim();
@@ -209,14 +238,15 @@ function formatTimeArabic(isoString) {
       return isoString;
     }
 
-    // Convert UTC to Gulf time (UTC+3)
-    const gulfDate = new Date(date.getTime() + 3 * 60 * 60 * 1000);
+    // Convert UTC to clinic local time using dynamic offset
+    const offset = getClinicOffset();
+    const localDate = new Date(date.getTime() + offset * 60 * 60 * 1000);
 
     const days = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
-    const dayName = days[gulfDate.getUTCDay()];
+    const dayName = days[localDate.getUTCDay()];
 
-    let hours = gulfDate.getUTCHours();
-    const minutes = gulfDate.getUTCMinutes();
+    let hours = localDate.getUTCHours();
+    const minutes = localDate.getUTCMinutes();
     const period = hours >= 12 ? "مساءً" : "صباحاً";
     if (hours > 12) hours -= 12;
     if (hours === 0) hours = 12;
@@ -442,30 +472,34 @@ function calculateFreeSlots(busyPeriods, windowStartUTC, windowEndUTC) {
   return slots;
 }
 
-// ── Get working hours window (UTC) for a given date
+// ── Get working hours window (UTC) for a given date — dynamic timezone
 function getWorkingWindow(date) {
   const d = new Date(date);
   const year = d.getUTCFullYear();
   const month = d.getUTCMonth();
   const day = d.getUTCDate();
+  const offset = getClinicOffset();
 
-  const start = new Date(Date.UTC(year, month, day, WORKING_HOURS_START_UTC, 0, 0));
-  const end = new Date(Date.UTC(year, month, day, WORKING_HOURS_END_UTC, 0, 0));
+  // Convert local working hours to UTC by subtracting offset
+  const startUTC = WORKING_HOURS_LOCAL_START - offset;
+  const endUTC = WORKING_HOURS_LOCAL_END - offset;
+
+  const start = new Date(Date.UTC(year, month, day, startUTC, 0, 0));
+  const end = new Date(Date.UTC(year, month, day, endUTC, 0, 0));
 
   return { start, end };
 }
 
-// ── Get next working day (skip Sunday — clinic is Mon-Sat)
+// ── Get next working day (skip Sunday — clinic is Mon-Sat) — dynamic timezone
 function getNextWorkingDay(date) {
   const d = new Date(date);
   d.setUTCDate(d.getUTCDate() + 1);
 
-  // Sunday = 0 in UTC. Gulf Sunday = UTC could be Sat night or Sun.
-  // Gulf calendar: Mon-Sat open, Sun closed.
-  // We work with Gulf day: add 3h to UTC to get Gulf day.
-  const gulfDate = new Date(d.getTime() + 3 * 60 * 60 * 1000);
-  if (gulfDate.getUTCDay() === 0) {
-    // Gulf Sunday — skip to Monday
+  // Use clinic timezone to determine the local day
+  const offset = getClinicOffset();
+  const localDate = new Date(d.getTime() + offset * 60 * 60 * 1000);
+  if (localDate.getUTCDay() === 0) {
+    // Local Sunday — skip to Monday
     d.setUTCDate(d.getUTCDate() + 1);
   }
 
@@ -542,7 +576,7 @@ async function findAlternative(utcStart) {
     const day2FreeAll = calculateFreeSlots(day2Busy, day2Window.start, day2Window.end);
 
     // Step 3: Exact same time on Day 2
-    // Calculate the same Gulf hour on Day 2
+    // Calculate the same local hour on Day 2
     const requestedHourUTC = requested.getUTCHours();
     const requestedMinUTC = requested.getUTCMinutes();
     const day2SameTime = new Date(Date.UTC(
@@ -608,35 +642,36 @@ async function isRaceCondition(userPhone, failedUtcStart) {
   return diffMs < 5 * 60 * 1000;
 }
 
-// ── Resolve day name/word to a UTC date
+// ── Resolve day name/word to a UTC date — dynamic timezone
 function resolveDay(dayStr) {
   const now = new Date();
-  // Current Gulf date (UTC+3)
-  const gulfNow = new Date(now.getTime() + 3 * 60 * 60 * 1000);
-  const gulfToday = new Date(Date.UTC(gulfNow.getUTCFullYear(), gulfNow.getUTCMonth(), gulfNow.getUTCDate()));
+  // Current local date using clinic timezone
+  const offset = getClinicOffset();
+  const localNow = new Date(now.getTime() + offset * 60 * 60 * 1000);
+  const localToday = new Date(Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), localNow.getUTCDate()));
 
   const lower = dayStr.toLowerCase().trim();
 
   // Today
   if (["today", "اليوم", "هلأ"].includes(lower)) {
-    return gulfToday;
+    return localToday;
   }
 
   // Tomorrow
   if (["tomorrow", "غداً", "غدا", "بكرة", "بكره", "bokra"].includes(lower)) {
-    const d = new Date(gulfToday);
+    const d = new Date(localToday);
     d.setUTCDate(d.getUTCDate() + 1);
     return d;
   }
 
   // Day after tomorrow
   if (["day_after_tomorrow", "بعد غد", "بعد بكرة", "بعد بكره"].includes(lower)) {
-    const d = new Date(gulfToday);
+    const d = new Date(localToday);
     d.setUTCDate(d.getUTCDate() + 2);
     return d;
   }
 
-  // Day names → next occurrence (Gulf week: Sun=0, Mon=1, ..., Sat=6)
+  // Day names → next occurrence (Sun=0, Mon=1, ..., Sat=6)
   const dayMap = {
     "sunday": 0, "الأحد": 0, "الاحد": 0,
     "monday": 1, "الاثنين": 1, "الإثنين": 1,
@@ -649,33 +684,39 @@ function resolveDay(dayStr) {
 
   const targetDay = dayMap[lower];
   if (targetDay !== undefined) {
-    const currentDay = gulfToday.getUTCDay();
+    const currentDay = localToday.getUTCDay();
     let daysAhead = targetDay - currentDay;
     if (daysAhead <= 0) daysAhead += 7; // Next week if today or past
-    const d = new Date(gulfToday);
+    const d = new Date(localToday);
     d.setUTCDate(d.getUTCDate() + daysAhead);
     return d;
   }
 
   // Fallback: try tomorrow
   console.log(`resolveDay: unknown day "${dayStr}", defaulting to tomorrow`);
-  const d = new Date(gulfToday);
+  const d = new Date(localToday);
   d.setUTCDate(d.getUTCDate() + 1);
   return d;
 }
 
-// ── Select 3-4 well-spread slots across morning, midday, afternoon
+// ── Select 3-4 well-spread slots across morning, midday, afternoon — dynamic timezone
 function selectSpreadSlots(freeSlots) {
   if (freeSlots.length === 0) return [];
   if (freeSlots.length <= 4) return freeSlots;
 
-  // Split into time windows (Gulf time = UTC + 3h)
-  // Morning: 9AM-12PM Gulf = 6:00-9:00 UTC
-  // Midday: 12PM-3PM Gulf = 9:00-12:00 UTC
-  // Afternoon: 3PM-6PM Gulf = 12:00-15:00 UTC
-  const morning = freeSlots.filter(s => s.getUTCHours() >= 6 && s.getUTCHours() < 9);
-  const midday = freeSlots.filter(s => s.getUTCHours() >= 9 && s.getUTCHours() < 12);
-  const afternoon = freeSlots.filter(s => s.getUTCHours() >= 12 && s.getUTCHours() < 15);
+  // Split into time windows using dynamic clinic timezone
+  const offset = getClinicOffset();
+  // Morning: 9AM-12PM local → (9-offset) to (12-offset) UTC
+  // Midday: 12PM-3PM local → (12-offset) to (15-offset) UTC
+  // Afternoon: 3PM-6PM local → (15-offset) to (18-offset) UTC
+  const morningStartUTC = 9 - offset;
+  const middayStartUTC = 12 - offset;
+  const afternoonStartUTC = 15 - offset;
+  const afternoonEndUTC = 18 - offset;
+
+  const morning = freeSlots.filter(s => s.getUTCHours() >= morningStartUTC && s.getUTCHours() < middayStartUTC);
+  const midday = freeSlots.filter(s => s.getUTCHours() >= middayStartUTC && s.getUTCHours() < afternoonStartUTC);
+  const afternoon = freeSlots.filter(s => s.getUTCHours() >= afternoonStartUTC && s.getUTCHours() < afternoonEndUTC);
 
   const picks = [];
 
@@ -706,9 +747,10 @@ async function checkDayAvailability(dayStr) {
     const targetDate = resolveDay(dayStr);
     const window = getWorkingWindow(targetDate);
 
-    // Check if target day is Sunday (Gulf) — clinic closed
-    const gulfDate = new Date(targetDate.getTime() + 3 * 60 * 60 * 1000);
-    if (gulfDate.getUTCDay() === 0) {
+    // Check if target day is Sunday (clinic local time) — clinic closed
+    const offset = getClinicOffset();
+    const localDate = new Date(targetDate.getTime() + offset * 60 * 60 * 1000);
+    if (localDate.getUTCDay() === 0) {
       return { status: "closed", day: dayStr };
     }
 
