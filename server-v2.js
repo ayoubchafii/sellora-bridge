@@ -907,7 +907,27 @@ async function callClaude(userPhone, userMessage) {
     dynamicPrompt += `\n- الاسم: ${clinicData.clinic_name_ar}`;
     if (clinicData.location) dynamicPrompt += `\n- الموقع: ${clinicData.location}`;
     if (clinicData.doctors) dynamicPrompt += `\n- الأطباء: ${clinicData.doctors}`;
-    if (clinicData.knowledge_base) dynamicPrompt += `\n${clinicData.knowledge_base}`;
+
+    // ── DUAL-TIER KNOWLEDGE SYSTEM (Step 11)
+    if (clinicData.use_rag) {
+      // Enterprise tier: RAG vector search (DORMANT — no clients use this yet)
+      // When activated: query clinic_vectors table with patient's message embedding
+      // Fall back to clinic_summary if vector search fails
+      try {
+        // TODO: Implement vector search with AWS Titan Embeddings
+        // For now, fall back to text injection
+        console.log(`RAG mode enabled for ${clinicData.clinic_name_en} — falling back to text (not yet implemented)`);
+        if (clinicData.clinic_summary) dynamicPrompt += `\n${clinicData.clinic_summary}`;
+        if (clinicData.knowledge_base) dynamicPrompt += `\n${clinicData.knowledge_base}`;
+      } catch (ragErr) {
+        console.error("RAG error, falling back to text:", ragErr.message);
+        if (clinicData.knowledge_base) dynamicPrompt += `\n${clinicData.knowledge_base}`;
+      }
+    } else {
+      // Basic tier: direct text injection (<50K chars)
+      if (clinicData.knowledge_base) dynamicPrompt += `\n${clinicData.knowledge_base}`;
+    }
+
     if (clinicData.languages) {
       const langMap = { ar: "العربية", en: "الإنجليزية", fr: "الفرنسية" };
       const langNames = clinicData.languages.split(",").map(l => langMap[l.trim()] || l.trim()).join(" و");
@@ -974,6 +994,20 @@ app.post("/webhook", async (req, res) => {
     const message = changes?.value?.messages?.[0];
 
     if (!message) return;
+
+    // ── BOUNCER: check if this WhatsApp number is a known client
+    const incomingPhoneNumberId = changes?.value?.metadata?.phone_number_id;
+    if (incomingPhoneNumberId) {
+      const clinic = getClientByPhoneNumberId(incomingPhoneNumberId);
+      if (!clinic) {
+        console.log(`BOUNCER: Unknown phone_number_id ${incomingPhoneNumberId} — ignoring`);
+        return;
+      }
+      if (!clinic.active) {
+        console.log(`BOUNCER: Clinic ${clinic.clinic_name_en} is inactive — ignoring`);
+        return;
+      }
+    }
 
     const userPhone = message.from;
 
