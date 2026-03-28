@@ -361,10 +361,14 @@ async function queryDayAvailability(searchStart, searchEnd) {
     return [];
   }
 
+  // Get calendar ID from database
+  const clinicData = getClientByPhoneNumberId(PHONE_NUMBER_ID);
+
   const payload = {
     type: "search",
     search_date_start: searchStart,
     search_date_end: searchEnd,
+    calendar_id: clinicData ? clinicData.appointments_cal_id : "",
   };
 
   console.log("Querying availability:", payload);
@@ -739,6 +743,9 @@ async function triggerBooking(bookingParams, patientPhone) {
     return { status: "error" };
   }
 
+  // Get calendar IDs from database
+  const clinicData = getClientByPhoneNumberId(PHONE_NUMBER_ID);
+
   const payload = {
     name: bookingParams.name || "",
     phone: bookingParams.phone || patientPhone,
@@ -746,6 +753,8 @@ async function triggerBooking(bookingParams, patientPhone) {
     service: bookingParams.service || "free consultation",
     patient_phone: patientPhone,
     clinic_owner_phone: CLINIC_OWNER_PHONE,
+    calendar_id: clinicData ? clinicData.appointments_cal_id : "",
+    working_hours_cal_id: clinicData ? clinicData.working_hours_cal_id : "",
   };
 
   console.log("Triggering BOOKING webhook:", payload);
@@ -771,11 +780,15 @@ async function triggerCancel(cancelParams, patientPhone) {
     return { status: "error" };
   }
 
+  // Get calendar ID from database
+  const clinicData = getClientByPhoneNumberId(PHONE_NUMBER_ID);
+
   const payload = {
     type: "cancel",
     name: cancelParams.name || "",
     phone: cancelParams.phone || patientPhone,
     current_utc: new Date().toISOString().replace(".000Z", "+00:00"),
+    calendar_id: clinicData ? clinicData.appointments_cal_id : "",
   };
 
   console.log("Triggering CANCEL webhook:", payload);
