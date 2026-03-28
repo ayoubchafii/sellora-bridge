@@ -1089,70 +1089,38 @@ async function callClaude(userPhone, userMessage, clinicId) {
 app.get("/debug-templates", async (req, res) => {
   const results = {};
   
-  // Approach 1: Get WABA ID from phone number
+  // Test: Send actual template to actual notification phone using PHONE_NUMBER_ID
   try {
-    const resp = await axios.get(
-      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}`,
-      { 
-        headers: { Authorization: `Bearer ${WA_TOKEN}` },
-        params: { fields: "id,display_phone_number,verified_name,account_id" }
+    const notifPhone = "212688619309";
+    const payload = {
+      messaging_product: "whatsapp",
+      to: notifPhone,
+      type: "template",
+      template: {
+        name: "new_booking",
+        language: { code: "ar" },
+        components: [{
+          type: "body",
+          parameters: [
+            { type: "text", text: "تجربة" },
+            { type: "text", text: "0501234567" },
+            { type: "text", text: "تنظيف الأسنان" },
+            { type: "text", text: "الاثنين الساعة 3 مساءً" },
+          ]
+        }]
       }
-    );
-    results.phone_info = resp.data;
+    };
+    results.payload = payload;
+    results.sender_phone_id = PHONE_NUMBER_ID;
     
-    // If we got account_id, query templates
-    if (resp.data.account_id) {
-      try {
-        const tplResp = await axios.get(
-          `https://graph.facebook.com/v22.0/${resp.data.account_id}/message_templates`,
-          { 
-            headers: { Authorization: `Bearer ${WA_TOKEN}` },
-            params: { limit: 10, fields: "name,language,status,category" }
-          }
-        );
-        results.templates = tplResp.data;
-      } catch (tplErr) {
-        results.tpl_error = tplErr.response?.data || tplErr.message;
-      }
-    }
+    const resp = await axios.post(
+      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+      payload,
+      { headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" } }
+    );
+    results.success = resp.data;
   } catch (err) {
-    results.phone_error = err.response?.data || err.message;
-  }
-
-  // Approach 2: Try sending a test template with different language codes
-  const testCodes = ["ar", "ar_AR", "ar_SA", "ar_AE", "ar_EG"];
-  results.language_tests = {};
-  for (const code of testCodes) {
-    try {
-      // Dry run - send to a fake number to see which code is valid
-      // Actually, let's just try each and capture the error
-      const resp = await axios.post(
-        `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
-        {
-          messaging_product: "whatsapp",
-          to: "0000000000",
-          type: "template",
-          template: {
-            name: "new_booking",
-            language: { code: code },
-            components: [{
-              type: "body",
-              parameters: [
-                { type: "text", text: "test" },
-                { type: "text", text: "test" },
-                { type: "text", text: "test" },
-                { type: "text", text: "test" },
-              ]
-            }]
-          }
-        },
-        { headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" } }
-      );
-      results.language_tests[code] = "SUCCESS: " + JSON.stringify(resp.data);
-    } catch (err) {
-      const errMsg = err.response?.data?.error?.message || err.message;
-      results.language_tests[code] = errMsg;
-    }
+    results.error = err.response?.data || err.message;
   }
 
   res.json(results);
