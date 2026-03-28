@@ -1084,6 +1084,24 @@ async function callClaude(userPhone, userMessage, clinicId) {
 }
 
 // ── STEP 1: Meta webhook verification (GET)
+
+// ── DEBUG: Check template language codes (temporary — remove after fixing)
+app.get("/debug-templates", async (req, res) => {
+  try {
+    const wabaId = "2757794811265822"; // WhatsApp Business Account ID
+    const response = await axios.get(
+      `https://graph.facebook.com/v22.0/${wabaId}/message_templates`,
+      {
+        headers: { Authorization: `Bearer ${WA_TOKEN}` },
+        params: { limit: 10 },
+      }
+    );
+    res.json(response.data);
+  } catch (err) {
+    res.json({ error: err.response?.data || err.message });
+  }
+});
+
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
