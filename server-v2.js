@@ -1089,48 +1089,70 @@ async function callClaude(userPhone, userMessage, clinicId) {
 app.get("/debug-templates", async (req, res) => {
   const results = {};
   
-  // Step 1: Find WABA ID from business ID
+  // Approach 1: Get WABA ID from phone number
   try {
-    const bizId = "78287671101838";
-    const wabaResp = await axios.get(
-      `https://graph.facebook.com/v22.0/${bizId}/owned_whatsapp_business_accounts`,
-      { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
+    const resp = await axios.get(
+      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}`,
+      { 
+        headers: { Authorization: `Bearer ${WA_TOKEN}` },
+        params: { fields: "id,display_phone_number,verified_name,account_id" }
+      }
     );
-    results.step1_waba = wabaResp.data;
+    results.phone_info = resp.data;
     
-    // Step 2: If we found WABA IDs, query templates from the first one
-    const wabaIds = wabaResp.data?.data?.map(w => w.id) || [];
-    for (const wabaId of wabaIds) {
+    // If we got account_id, query templates
+    if (resp.data.account_id) {
       try {
         const tplResp = await axios.get(
-          `https://graph.facebook.com/v22.0/${wabaId}/message_templates`,
+          `https://graph.facebook.com/v22.0/${resp.data.account_id}/message_templates`,
           { 
             headers: { Authorization: `Bearer ${WA_TOKEN}` },
             params: { limit: 10, fields: "name,language,status,category" }
           }
         );
-        results[`step2_templates_${wabaId}`] = tplResp.data;
+        results.templates = tplResp.data;
       } catch (tplErr) {
-        results[`step2_error_${wabaId}`] = tplErr.response?.data || tplErr.message;
+        results.tpl_error = tplErr.response?.data || tplErr.message;
       }
     }
   } catch (err) {
-    results.step1_error = err.response?.data || err.message;
+    results.phone_error = err.response?.data || err.message;
   }
 
-  // Step 3: Also try the WABA ID from architecture.md
-  try {
-    const archWabaId = "2757794811265822";
-    const tplResp = await axios.get(
-      `https://graph.facebook.com/v22.0/${archWabaId}/message_templates`,
-      { 
-        headers: { Authorization: `Bearer ${WA_TOKEN}` },
-        params: { limit: 10, fields: "name,language,status,category" }
-      }
-    );
-    results.step3_arch_waba = tplResp.data;
-  } catch (err) {
-    results.step3_error = err.response?.data || err.message;
+  // Approach 2: Try sending a test template with different language codes
+  const testCodes = ["ar", "ar_AR", "ar_SA", "ar_AE", "ar_EG"];
+  results.language_tests = {};
+  for (const code of testCodes) {
+    try {
+      // Dry run - send to a fake number to see which code is valid
+      // Actually, let's just try each and capture the error
+      const resp = await axios.post(
+        `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+        {
+          messaging_product: "whatsapp",
+          to: "0000000000",
+          type: "template",
+          template: {
+            name: "new_booking",
+            language: { code: code },
+            components: [{
+              type: "body",
+              parameters: [
+                { type: "text", text: "test" },
+                { type: "text", text: "test" },
+                { type: "text", text: "test" },
+                { type: "text", text: "test" },
+              ]
+            }]
+          }
+        },
+        { headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" } }
+      );
+      results.language_tests[code] = "SUCCESS: " + JSON.stringify(resp.data);
+    } catch (err) {
+      const errMsg = err.response?.data?.error?.message || err.message;
+      results.language_tests[code] = errMsg;
+    }
   }
 
   res.json(results);
