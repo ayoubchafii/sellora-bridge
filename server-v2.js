@@ -86,6 +86,9 @@ function getClientByPhoneNumberId(phoneNumberId) {
 loadClientsFromDB();
 setInterval(loadClientsFromDB, 30 * 60 * 1000);
 
+// ── Message debouncer (3-second buffer for rapid WhatsApp messages)
+const messageBuffers = new Map(); // phone → {texts: [], timer: null}
+
 // ══════════════════════════════════════════════════════════════
 // ── UPSTASH REDIS HELPERS
 // ══════════════════════════════════════════════════════════════
@@ -998,6 +1001,38 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`Incoming from ${userPhone}: ${userText}`);
 
+    // ── DEBOUNCER: buffer rapid messages for 3 seconds
+    if (!messageBuffers.has(userPhone)) {
+      messageBuffers.set(userPhone, { texts: [], timer: null });
+    }
+
+    const buffer = messageBuffers.get(userPhone);
+    buffer.texts.push(userText);
+
+    // Reset the 3-second timer on each new message
+    if (buffer.timer) clearTimeout(buffer.timer);
+
+    buffer.timer = setTimeout(async () => {
+      const combinedText = buffer.texts.join(" ");
+      messageBuffers.delete(userPhone);
+
+      console.log(`Debounced message from ${userPhone}: ${combinedText}`);
+
+      try {
+        await processTextMessage(userPhone, combinedText);
+      } catch (err) {
+        console.error("Process error:", err.response?.data || err.message);
+      }
+    }, 3000);
+
+  } catch (err) {
+    console.error("Error:", err.response?.data || err.message);
+  }
+});
+
+// ── Process debounced text message through Sara
+async function processTextMessage(userPhone, userText) {
+  try {
     // ── First call: Sara responds to the patient's message
     const saraResponse = await callClaude(userPhone, userText);
     console.log(`Sara raw response: ${saraResponse}`);
@@ -1143,7 +1178,7 @@ app.post("/webhook", async (req, res) => {
   } catch (err) {
     console.error("Error:", err.response?.data || err.message);
   }
-});
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Sara v2 running on port ${PORT}`));
