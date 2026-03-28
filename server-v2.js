@@ -406,18 +406,21 @@ async function notifyClinicOwner(type, details, clinicId) {
   if (!templateName) return;
 
   try {
+    const templatePayload = {
+      messaging_product: "whatsapp",
+      to: notificationPhone,
+      type: "template",
+      template: {
+        name: templateName,
+        language: { code: "ar", policy: "deterministic" },
+        components: components,
+      },
+    };
+    console.log("Sending template:", JSON.stringify(templatePayload, null, 2));
+
     await axios.post(
       `https://graph.facebook.com/v22.0/${senderPhoneId}/messages`,
-      {
-        messaging_product: "whatsapp",
-        to: notificationPhone,
-        type: "template",
-        template: {
-          name: templateName,
-          language: { code: "ar" },
-          components: components,
-        },
-      },
+      templatePayload,
       {
         headers: {
           Authorization: `Bearer ${WA_TOKEN}`,
@@ -427,8 +430,9 @@ async function notifyClinicOwner(type, details, clinicId) {
     );
     console.log(`Clinic owner notified via template: ${type}`);
   } catch (err) {
-    // Fallback to regular text message if template fails
-    console.error("Template notification error:", err.response?.data || err.message);
+    // Log full error details for debugging
+    const errData = err.response?.data;
+    console.error("Template notification error:", JSON.stringify(errData, null, 2));
     console.log("Falling back to regular text message...");
     try {
       let fallbackMsg = "";
