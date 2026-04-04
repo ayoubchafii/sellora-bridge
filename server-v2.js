@@ -3,6 +3,8 @@ const axios = require("axios");
 const fs = require("fs");
 const { BedrockRuntimeClient, ConverseCommand } = require("@aws-sdk/client-bedrock-runtime");
 const { Pool } = require("pg");
+const { createActivationHandler } = require("./services/activationService");
+const { createRagService } = require("./services/ragService");
 
 const app = express();
 app.use(express.json());
@@ -86,6 +88,9 @@ function getClientByPhoneNumberId(phoneNumberId) {
 // Load clients on startup + refresh every 30 minutes
 loadClientsFromDB();
 setInterval(loadClientsFromDB, 30 * 60 * 1000);
+
+// ── Initialize RAG service (Enterprise vector search)
+const ragService = pool ? createRagService({ bedrockClient, pool }) : null;
 
 // ── Message debouncer (3-second buffer for rapid WhatsApp messages)
 const messageBuffers = new Map(); // phone → {texts: [], timer: null}
@@ -1025,19 +1030,25 @@ async function callClaude(userPhone, userMessage, clinicId) {
     if (clinicData.doctors) dynamicPrompt += `\n- الأطباء: ${clinicData.doctors}`;
 
     // ── DUAL-TIER KNOWLEDGE SYSTEM (Step 11)
-    if (clinicData.use_rag) {
-      // Enterprise tier: RAG vector search (DORMANT — no clients use this yet)
-      // When activated: query clinic_vectors table with patient's message embedding
-      // Fall back to clinic_summary if vector search fails
+    if (clinicData.use_rag && ragService) {
+      // Enterprise tier: RAG vector search via Titan Embeddings + pgvector
       try {
-        // TODO: Implement vector search with AWS Titan Embeddings
-        // For now, fall back to text injection
-        console.log(`RAG mode enabled for ${clinicData.clinic_name_en} — falling back to text (not yet implemented)`);
+        const chunks = await ragService.searchClinicVectors(clinicId, userMessage, 3);
         if (clinicData.clinic_summary) dynamicPrompt += `\n${clinicData.clinic_summary}`;
-        if (clinicData.knowledge_base) dynamicPrompt += `\n${clinicData.knowledge_base}`;
+        if (chunks.length > 0) {
+          dynamicPrompt += `\n\nمعلومات ذات صلة من قاعدة بيانات العيادة:`;
+          for (const chunk of chunks) {
+            dynamicPrompt += `\n${chunk.content}`;
+          }
+        } else if (clinicData.knowledge_base) {
+          // No vector results — fall back to full text
+          dynamicPrompt += `\n${clinicData.knowledge_base}`;
+        }
+        console.log(`RAG: found ${chunks.length} relevant chunks for "${userMessage.substring(0, 50)}..."`);
       } catch (ragErr) {
         console.error("RAG error, falling back to text:", ragErr.message);
         if (clinicData.knowledge_base) dynamicPrompt += `\n${clinicData.knowledge_base}`;
+        else if (clinicData.clinic_summary) dynamicPrompt += `\n${clinicData.clinic_summary}`;
       }
     } else {
       // Basic tier: direct text injection (<50K chars)
@@ -1353,90 +1364,14 @@ async function processTextMessage(userPhone, userText, clinicId) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ── ACTIVATION ENDPOINT — Sets clinic active after verifying setup
-// ── Also sends WhatsApp confirmation to clinic owner (B8)
+// ── API ROUTES — Thin handlers delegating to services
 // ══════════════════════════════════════════════════════════════
 
-app.post("/api/activate", async (req, res) => {
-  // ── Auth check
-  const authHeader = req.headers.authorization || "";
-  if (!ADMIN_SECRET || authHeader !== `Bearer ${ADMIN_SECRET}`) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+app.post("/api/activate", createActivationHandler({ pool, loadClientsFromDB, sendWhatsApp, ADMIN_SECRET }));
 
-  const { phone_number_id } = req.body;
-  if (!phone_number_id) {
-    return res.status(400).json({ error: "Missing phone_number_id" });
-  }
-
-  try {
-    // ── Query DB directly (not cache — inactive clinics aren't cached)
-    const result = await pool.query(
-      "SELECT * FROM clinics WHERE phone_number_id = $1",
-      [phone_number_id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Clinic not found" });
-    }
-
-    const clinic = result.rows[0];
-
-    // ── Check required fields
-    const missing = [];
-    if (!clinic.appointments_cal_id) missing.push("appointments_cal_id");
-    if (!clinic.working_hours_cal_id) missing.push("working_hours_cal_id");
-    if (!clinic.knowledge_base) missing.push("knowledge_base");
-
-    if (missing.length > 0) {
-      return res.status(400).json({
-        error: "Clinic not ready — missing fields",
-        missing: missing,
-      });
-    }
-
-    // ── Already active?
-    if (clinic.active) {
-      return res.status(200).json({ status: "already_active", clinic_name: clinic.clinic_name_ar });
-    }
-
-    // ── Activate
-    await pool.query(
-      "UPDATE clinics SET active = TRUE WHERE phone_number_id = $1",
-      [phone_number_id]
-    );
-
-    // ── Refresh client cache so Sara starts responding immediately
-    await loadClientsFromDB();
-
-    // ── Send WhatsApp confirmation to clinic owner (B8)
-    if (clinic.notification_phone) {
-      const confirmationMessage =
-        `مرحباً! تم تفعيل مساعدة الحجز الذكية "سارة" لعيادتكم ${clinic.clinic_name_ar} بنجاح.\n\n` +
-        `يمكن لمرضاكم الآن حجز المواعيد عبر الواتساب.\n\n` +
-        `للتجربة، أرسلوا "سلام" على نفس هذا الرقم.`;
-
-      try {
-        await sendWhatsApp(clinic.notification_phone, confirmationMessage, phone_number_id);
-        console.log(`Activation confirmation sent to ${clinic.notification_phone}`);
-      } catch (waErr) {
-        console.error("Failed to send activation WhatsApp:", waErr.message);
-        // Don't fail the activation just because the notification didn't send
-      }
-    }
-
-    console.log(`Clinic activated: ${clinic.clinic_name_ar} (${phone_number_id})`);
-    return res.status(200).json({
-      status: "activated",
-      clinic_name: clinic.clinic_name_ar,
-      notification_sent: !!clinic.notification_phone,
-    });
-
-  } catch (err) {
-    console.error("Activation error:", err.message);
-    return res.status(500).json({ error: "Server error" });
-  }
-});
+if (ragService) {
+  app.post("/api/embed-clinic", ragService.createEmbedHandler({ ADMIN_SECRET }));
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Sara v2 running on port ${PORT}`));
