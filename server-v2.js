@@ -5,6 +5,7 @@ const { BedrockRuntimeClient, ConverseCommand } = require("@aws-sdk/client-bedro
 const { Pool } = require("pg");
 const { createActivationHandler } = require("./services/activationService");
 const { createRagService } = require("./services/ragService");
+const { createAdminRouter } = require("./routes/admin");
 
 const app = express();
 app.use(express.json());
@@ -1364,7 +1365,7 @@ async function processTextMessage(userPhone, userText, clinicId) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ── API ROUTES — Thin handlers delegating to services
+// ── API ROUTES
 // ══════════════════════════════════════════════════════════════
 
 app.post("/api/activate", createActivationHandler({ pool, loadClientsFromDB, sendWhatsApp, ADMIN_SECRET }));
@@ -1372,6 +1373,8 @@ app.post("/api/activate", createActivationHandler({ pool, loadClientsFromDB, sen
 if (ragService) {
   app.post("/api/embed-clinic", ragService.createEmbedHandler({ ADMIN_SECRET }));
 }
+
+app.use("/api/clinics", createAdminRouter({ pool, loadClientsFromDB, ADMIN_SECRET }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Sara v2 running on port ${PORT}`));
