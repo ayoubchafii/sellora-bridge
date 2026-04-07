@@ -8,7 +8,7 @@ const { createRagService } = require("./services/ragService");
 const { createAdminRouter } = require("./routes/admin");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "20mb" }));
 
 // ── CONFIG
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
@@ -1374,7 +1374,7 @@ if (ragService) {
   app.post("/api/embed-clinic", ragService.createEmbedHandler({ ADMIN_SECRET }));
 }
 
-app.use("/api/clinics", createAdminRouter({ pool, loadClientsFromDB, ADMIN_SECRET }));
+app.use("/api/clinics", createAdminRouter({ pool, loadClientsFromDB, ADMIN_SECRET, bedrockClient, ragService }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Sara v2 running on port ${PORT}`));
