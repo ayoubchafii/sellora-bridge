@@ -22,7 +22,7 @@ function createCalendarBridgeService({ pool }) {
 
     // Read clinic from DB (not cache — inactive clinics aren't cached)
     const result = await pool.query(
-      "SELECT phone_number_id, clinic_name_en, clinic_name_ar, client_email, appointments_cal_id FROM clinics WHERE phone_number_id = $1",
+      "SELECT phone_number_id, clinic_name_en, clinic_name_ar, client_email, appointments_cal_id, timezone FROM clinics WHERE phone_number_id = $1",
       [clinicId]
     );
 
@@ -50,6 +50,7 @@ function createCalendarBridgeService({ pool }) {
       clinic_id: clinicId,
       clinic_name: clinicName,
       client_email: clinic.client_email.trim(),
+      timezone: clinic.timezone || "Asia/Riyadh",
       action: "create_calendars",
     };
 
