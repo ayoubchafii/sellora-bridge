@@ -3,6 +3,7 @@
 // ── Triggers Make.com to create Google Calendars for a clinic
 // ── Handles callback from Make.com after calendars are created
 // ── Phase M — Only creates Appointments calendar (no Working Hours)
+// ── Timezone fix: sends clinic timezone to Make.com for proper calendar metadata
 // ══════════════════════════════════════════════════════════════
 
 const axios = require("axios");
