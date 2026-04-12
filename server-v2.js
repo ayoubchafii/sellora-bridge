@@ -6,6 +6,7 @@ const { Pool } = require("pg");
 const { createActivationHandler } = require("./services/activationService");
 const { createRagService } = require("./services/ragService");
 const { createAdminRouter } = require("./routes/admin");
+const { createBridgeRouter } = require("./routes/bridge");
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
@@ -28,10 +29,22 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 
 const MODEL_ID = "global.anthropic.claude-sonnet-4-6";
 
-// ── Clinic working hours (local time — converted to UTC dynamically per clinic)
-const WORKING_HOURS_LOCAL_START = 9;  // 9AM clinic local time
-const WORKING_HOURS_LOCAL_END = 18;   // 6PM clinic local time
+// ── Phase M: Working hours from database (no more hardcoded 9-18)
 const SLOT_DURATION_MIN = 30;
+
+// Gulf-market default schedule (used when clinic has no custom schedule)
+const DEFAULT_WORKING_SCHEDULE = {
+  sunday:    { open: "09:00", close: "18:00", breaks: [] },
+  monday:    { open: "09:00", close: "18:00", breaks: [] },
+  tuesday:   { open: "09:00", close: "18:00", breaks: [] },
+  wednesday: { open: "09:00", close: "18:00", breaks: [] },
+  thursday:  { open: "09:00", close: "18:00", breaks: [] },
+  friday:    null,
+  saturday:  { open: "09:00", close: "14:00", breaks: [] },
+};
+
+// Day index → name mapping for working_schedule lookup
+const DAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
 
 // ── Expiry times
 const CONV_EXPIRY_SECONDS = 7 * 24 * 60 * 60;       // 7 days for conversation history
@@ -552,38 +565,74 @@ function calculateFreeSlots(busyPeriods, windowStartUTC, windowEndUTC) {
   return slots;
 }
 
-// ── Get working hours window (UTC) for a given date — dynamic timezone
+// ── Get working hours window (UTC) for a given date — reads from clinic's working_schedule
+// Returns { start, end, breaks: [{start, end}] } or null if clinic is closed that day
 function getWorkingWindow(date, clinicId) {
   const d = new Date(date);
-  const year = d.getUTCFullYear();
-  const month = d.getUTCMonth();
-  const day = d.getUTCDate();
   const offset = getClinicOffset(clinicId);
 
-  // Convert local working hours to UTC by subtracting offset
-  const startUTC = WORKING_HOURS_LOCAL_START - offset;
-  const endUTC = WORKING_HOURS_LOCAL_END - offset;
-
-  const start = new Date(Date.UTC(year, month, day, startUTC, 0, 0));
-  const end = new Date(Date.UTC(year, month, day, endUTC, 0, 0));
-
-  return { start, end };
-}
-
-// ── Get next working day (skip Sunday — clinic is Mon-Sat) — dynamic timezone
-function getNextWorkingDay(date, clinicId) {
-  const d = new Date(date);
-  d.setUTCDate(d.getUTCDate() + 1);
-
-  // Use clinic timezone to determine the local day
-  const offset = getClinicOffset(clinicId);
+  // Convert UTC date to clinic local date to find the correct day of week
   const localDate = new Date(d.getTime() + offset * 60 * 60 * 1000);
-  if (localDate.getUTCDay() === 0) {
-    // Local Sunday — skip to Monday
-    d.setUTCDate(d.getUTCDate() + 1);
+  const dayName = DAY_NAMES[localDate.getUTCDay()];
+
+  // Get clinic's schedule from cache
+  const clinic = getClientByPhoneNumberId(clinicId);
+  const schedule = clinic?.working_schedule || DEFAULT_WORKING_SCHEDULE;
+  const daySchedule = schedule[dayName];
+
+  // null = closed
+  if (!daySchedule) {
+    return null;
   }
 
-  return d;
+  // Parse open/close times (format: "HH:MM")
+  const [openH, openM] = daySchedule.open.split(":").map(Number);
+  const [closeH, closeM] = daySchedule.close.split(":").map(Number);
+
+  const year = localDate.getUTCFullYear();
+  const month = localDate.getUTCMonth();
+  const day = localDate.getUTCDate();
+
+  // Convert local times to UTC
+  const start = new Date(Date.UTC(year, month, day, openH - offset, openM, 0));
+  const end = new Date(Date.UTC(year, month, day, closeH - offset, closeM, 0));
+
+  // Parse breaks into UTC busy periods
+  const breaks = (daySchedule.breaks || []).map(brk => {
+    const [bStartH, bStartM] = brk.start.split(":").map(Number);
+    const [bEndH, bEndM] = brk.end.split(":").map(Number);
+    return {
+      start: new Date(Date.UTC(year, month, day, bStartH - offset, bStartM, 0)),
+      end: new Date(Date.UTC(year, month, day, bEndH - offset, bEndM, 0)),
+    };
+  });
+
+  return { start, end, breaks };
+}
+
+// ── Get next working day (skips days marked null in schedule) — dynamic timezone
+function getNextWorkingDay(date, clinicId) {
+  const clinic = getClientByPhoneNumberId(clinicId);
+  const schedule = clinic?.working_schedule || DEFAULT_WORKING_SCHEDULE;
+  const offset = getClinicOffset(clinicId);
+
+  const d = new Date(date);
+
+  for (let attempt = 0; attempt < 7; attempt++) {
+    d.setUTCDate(d.getUTCDate() + 1);
+    const localDate = new Date(d.getTime() + offset * 60 * 60 * 1000);
+    const dayName = DAY_NAMES[localDate.getUTCDay()];
+
+    if (schedule[dayName] !== null && schedule[dayName] !== undefined) {
+      return d; // Found an open day
+    }
+  }
+
+  // Fallback: all 7 days closed? Return tomorrow anyway
+  console.error("getNextWorkingDay: no open days found in schedule. Returning tomorrow.");
+  const fallback = new Date(date);
+  fallback.setUTCDate(fallback.getUTCDate() + 1);
+  return fallback;
 }
 
 // ── Pick the best slot from a list: prefer forward from requested, then backward
@@ -606,6 +655,7 @@ function pickClosestSlot(freeSlots, requestedTime) {
 }
 
 // ── THE WATERFALL: Find alternative time (5-step search)
+// Phase M: now handles breaks as busy periods and null (closed) days
 async function findAlternative(utcStart, clinicId) {
   try {
     const requested = new Date(utcStart);
@@ -618,45 +668,59 @@ async function findAlternative(utcStart, clinicId) {
 
     // ── DAY 1 (same day as requested) ──
     const day1Window = getWorkingWindow(requested, clinicId);
-    const day1Start = day1Window.start.toISOString().replace(".000Z", "+00:00");
-    const day1End = day1Window.end.toISOString().replace(".000Z", "+00:00");
 
-    const day1Busy = await queryDayAvailability(day1Start, day1End, clinicId);
-    const day1FreeAll = calculateFreeSlots(day1Busy, day1Window.start, day1Window.end);
+    // Day 1 might be closed — skip to Day 2
+    if (day1Window) {
+      const day1Start = day1Window.start.toISOString().replace(".000Z", "+00:00");
+      const day1End = day1Window.end.toISOString().replace(".000Z", "+00:00");
 
-    // Step 1: ±2h from requested, clamped to working hours
-    const twoHoursMs = 2 * 60 * 60 * 1000;
-    const range1Start = new Date(Math.max(requested.getTime() - twoHoursMs, day1Window.start.getTime()));
-    const range1End = new Date(Math.min(requested.getTime() + twoHoursMs + SLOT_DURATION_MIN * 60 * 1000, day1Window.end.getTime()));
+      const day1Busy = await queryDayAvailability(day1Start, day1End, clinicId);
+      const day1AllBusy = [...day1Busy, ...day1Window.breaks];
+      const day1FreeAll = calculateFreeSlots(day1AllBusy, day1Window.start, day1Window.end);
 
-    const step1Slots = day1FreeAll.filter(s =>
-      s.getTime() >= range1Start.getTime() && s.getTime() < range1End.getTime()
-    );
+      // Step 1: ±2h from requested, clamped to working hours
+      const twoHoursMs = 2 * 60 * 60 * 1000;
+      const range1Start = new Date(Math.max(requested.getTime() - twoHoursMs, day1Window.start.getTime()));
+      const range1End = new Date(Math.min(requested.getTime() + twoHoursMs + SLOT_DURATION_MIN * 60 * 1000, day1Window.end.getTime()));
 
-    const step1Pick = pickClosestSlot(step1Slots, requested);
-    if (step1Pick) {
-      console.log(`WATERFALL Step 1: Found ${step1Pick.toISOString()} (±2h same day)`);
-      return { utc: step1Pick, sameDay: true };
-    }
+      const step1Slots = day1FreeAll.filter(s =>
+        s.getTime() >= range1Start.getTime() && s.getTime() < range1End.getTime()
+      );
 
-    // Step 2: Any free slot on Day 1
-    const step2Pick = pickClosestSlot(day1FreeAll, requested);
-    if (step2Pick) {
-      console.log(`WATERFALL Step 2: Found ${step2Pick.toISOString()} (same day, any time)`);
-      return { utc: step2Pick, sameDay: true };
+      const step1Pick = pickClosestSlot(step1Slots, requested);
+      if (step1Pick) {
+        console.log(`WATERFALL Step 1: Found ${step1Pick.toISOString()} (±2h same day)`);
+        return { utc: step1Pick, sameDay: true };
+      }
+
+      // Step 2: Any free slot on Day 1
+      const step2Pick = pickClosestSlot(day1FreeAll, requested);
+      if (step2Pick) {
+        console.log(`WATERFALL Step 2: Found ${step2Pick.toISOString()} (same day, any time)`);
+        return { utc: step2Pick, sameDay: true };
+      }
+    } else {
+      console.log("WATERFALL: Day 1 is closed per schedule, skipping to Day 2");
     }
 
     // ── DAY 2 (next working day) ──
     const day2Date = getNextWorkingDay(requested, clinicId);
     const day2Window = getWorkingWindow(day2Date, clinicId);
+
+    if (!day2Window) {
+      console.log("WATERFALL: Day 2 also closed. No alternative found.");
+      return null;
+    }
+
+    const twoHoursMs = 2 * 60 * 60 * 1000;
     const day2Start = day2Window.start.toISOString().replace(".000Z", "+00:00");
     const day2End = day2Window.end.toISOString().replace(".000Z", "+00:00");
 
     const day2Busy = await queryDayAvailability(day2Start, day2End, clinicId);
-    const day2FreeAll = calculateFreeSlots(day2Busy, day2Window.start, day2Window.end);
+    const day2AllBusy = [...day2Busy, ...day2Window.breaks];
+    const day2FreeAll = calculateFreeSlots(day2AllBusy, day2Window.start, day2Window.end);
 
     // Step 3: Exact same time on Day 2
-    // Calculate the same local hour on Day 2
     const requestedHourUTC = requested.getUTCHours();
     const requestedMinUTC = requested.getUTCMinutes();
     const day2SameTime = new Date(Date.UTC(
@@ -706,7 +770,6 @@ async function findAlternative(utcStart, clinicId) {
   }
 }
 
-// ── Build SYSTEM_RESULT for busy with alternative
 // ── Check if this is a race condition (booking failed on a previously suggested time)
 async function isRaceCondition(userPhone, failedUtcStart) {
   const suggested = await getLastSuggested(userPhone);
@@ -779,35 +842,42 @@ function resolveDay(dayStr, clinicId) {
   return d;
 }
 
-// ── Select 3-4 well-spread slots across morning, midday, afternoon — dynamic timezone
+// ── Select 3-4 well-spread slots — uses clinic's actual schedule hours
 function selectSpreadSlots(freeSlots, clinicId) {
   if (freeSlots.length === 0) return [];
   if (freeSlots.length <= 4) return freeSlots;
 
-  // Split into time windows using dynamic clinic timezone
   const offset = getClinicOffset(clinicId);
-  // Morning: 9AM-12PM local → (9-offset) to (12-offset) UTC
-  // Midday: 12PM-3PM local → (12-offset) to (15-offset) UTC
-  // Afternoon: 3PM-6PM local → (15-offset) to (18-offset) UTC
-  const morningStartUTC = 9 - offset;
-  const middayStartUTC = 12 - offset;
-  const afternoonStartUTC = 15 - offset;
-  const afternoonEndUTC = 18 - offset;
 
-  const morning = freeSlots.filter(s => s.getUTCHours() >= morningStartUTC && s.getUTCHours() < middayStartUTC);
-  const midday = freeSlots.filter(s => s.getUTCHours() >= middayStartUTC && s.getUTCHours() < afternoonStartUTC);
-  const afternoon = freeSlots.filter(s => s.getUTCHours() >= afternoonStartUTC && s.getUTCHours() < afternoonEndUTC);
+  // Get the working window for the first slot's day to determine hour boundaries
+  const window = getWorkingWindow(freeSlots[0], clinicId);
+  if (!window) return freeSlots.slice(0, 4);
+
+  const openLocalH = window.start.getUTCHours() + offset;
+  const closeLocalH = window.end.getUTCHours() + offset;
+  const totalHours = closeLocalH - openLocalH;
+
+  // Split working hours into 3 equal bands
+  const band1End = openLocalH + Math.floor(totalHours / 3);
+  const band2End = openLocalH + Math.floor((totalHours * 2) / 3);
+
+  const band1StartUTC = openLocalH - offset;
+  const band1EndUTC = band1End - offset;
+  const band2EndUTC = band2End - offset;
+  const band3EndUTC = closeLocalH - offset;
+
+  const band1 = freeSlots.filter(s => s.getUTCHours() >= band1StartUTC && s.getUTCHours() < band1EndUTC);
+  const band2 = freeSlots.filter(s => s.getUTCHours() >= band1EndUTC && s.getUTCHours() < band2EndUTC);
+  const band3 = freeSlots.filter(s => s.getUTCHours() >= band2EndUTC && s.getUTCHours() < band3EndUTC);
 
   const picks = [];
 
-  // Pick 1 from each window if available (pick middle of each window for variety)
-  if (morning.length > 0) picks.push(morning[Math.floor(morning.length / 2)]);
-  if (midday.length > 0) picks.push(midday[Math.floor(midday.length / 2)]);
-  if (afternoon.length > 0) picks.push(afternoon[Math.floor(afternoon.length / 2)]);
+  if (band1.length > 0) picks.push(band1[Math.floor(band1.length / 2)]);
+  if (band2.length > 0) picks.push(band2[Math.floor(band2.length / 2)]);
+  if (band3.length > 0) picks.push(band3[Math.floor(band3.length / 2)]);
 
-  // If we have fewer than 3, fill from the largest window
   if (picks.length < 3) {
-    const all = [...morning, ...midday, ...afternoon];
+    const all = [...band1, ...band2, ...band3];
     for (const slot of all) {
       if (picks.length >= 4) break;
       if (!picks.find(p => p.getTime() === slot.getTime())) {
@@ -816,29 +886,32 @@ function selectSpreadSlots(freeSlots, clinicId) {
     }
   }
 
-  // Sort chronologically
   picks.sort((a, b) => a.getTime() - b.getTime());
   return picks.slice(0, 4);
 }
 
 // ── Check availability for a given day — returns formatted slot list
+// Phase M: reads closed days from working_schedule, merges breaks as busy
 async function checkDayAvailability(dayStr, clinicId) {
   try {
     const targetDate = resolveDay(dayStr, clinicId);
     const window = getWorkingWindow(targetDate, clinicId);
 
-    // Check if target day is Sunday (clinic local time) — clinic closed
-    const offset = getClinicOffset(clinicId);
-    const localDate = new Date(targetDate.getTime() + offset * 60 * 60 * 1000);
-    if (localDate.getUTCDay() === 0) {
+    // null = clinic is closed that day
+    if (!window) {
       return { status: "closed", day: dayStr };
     }
 
     const searchStart = window.start.toISOString().replace(".000Z", "+00:00");
     const searchEnd = window.end.toISOString().replace(".000Z", "+00:00");
 
+    // Get appointment busy periods from Make.com
     const busyPeriods = await queryDayAvailability(searchStart, searchEnd, clinicId);
-    const freeSlots = calculateFreeSlots(busyPeriods, window.start, window.end);
+
+    // Merge schedule breaks (lunch, prayer) into busy periods
+    const allBusy = [...busyPeriods, ...window.breaks];
+
+    const freeSlots = calculateFreeSlots(allBusy, window.start, window.end);
 
     if (freeSlots.length === 0) {
       return { status: "fully_booked", day: dayStr };
@@ -857,6 +930,84 @@ async function checkDayAvailability(dayStr, clinicId) {
 // ══════════════════════════════════════════════════════════════
 // ── END Phase 3 functions
 // ══════════════════════════════════════════════════════════════
+
+// ── PRE-FLIGHT: Server-side working hours check (Phase M)
+// Scans the booking time string for day keywords and rejects closed days
+// BEFORE the request hits Make.com. This replaces Module 30 + Router 31.
+function checkWorkingHoursPreFlight(requestedTimeStr, clinicId) {
+  try {
+    if (!requestedTimeStr) return null;
+
+    const clinic = getClientByPhoneNumberId(clinicId);
+    const schedule = clinic?.working_schedule || DEFAULT_WORKING_SCHEDULE;
+    const offset = getClinicOffset(clinicId);
+    const now = new Date();
+    const localNow = new Date(now.getTime() + offset * 60 * 60 * 1000);
+
+    const lower = requestedTimeStr.toLowerCase ? requestedTimeStr.toLowerCase().trim() : String(requestedTimeStr).trim();
+
+    let targetDayIndex = null;
+
+    // Day name keywords (Arabic + English)
+    const dayMap = {
+      "sunday": 0, "الأحد": 0, "الاحد": 0,
+      "monday": 1, "الاثنين": 1, "الإثنين": 1,
+      "tuesday": 2, "الثلاثاء": 2,
+      "wednesday": 3, "الأربعاء": 3, "الاربعاء": 3,
+      "thursday": 4, "الخميس": 4,
+      "friday": 5, "الجمعة": 5,
+      "saturday": 6, "السبت": 6,
+    };
+
+    // Check for day names in the string
+    for (const [keyword, dayIdx] of Object.entries(dayMap)) {
+      if (lower.includes(keyword)) {
+        targetDayIndex = dayIdx;
+        break;
+      }
+    }
+
+    // Check for "today" keywords
+    if (targetDayIndex === null) {
+      const todayKeywords = ["today", "اليوم", "هلأ"];
+      for (const kw of todayKeywords) {
+        if (lower.includes(kw)) {
+          targetDayIndex = localNow.getUTCDay();
+          break;
+        }
+      }
+    }
+
+    // Check for "tomorrow" keywords
+    if (targetDayIndex === null) {
+      const tomorrowKeywords = ["tomorrow", "غداً", "غدا", "بكرة", "بكره", "bokra"];
+      for (const kw of tomorrowKeywords) {
+        if (lower.includes(kw)) {
+          const tomorrow = new Date(localNow);
+          tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+          targetDayIndex = tomorrow.getUTCDay();
+          break;
+        }
+      }
+    }
+
+    // If we couldn't determine the day, let it through to Make.com
+    if (targetDayIndex === null) return null;
+
+    const dayName = DAY_NAMES[targetDayIndex];
+
+    // Check if the clinic is closed on that day
+    if (schedule[dayName] === null || schedule[dayName] === undefined) {
+      console.log(`PRE-FLIGHT: Clinic is closed on ${dayName}. Blocking booking.`);
+      return { status: "outside_hours" };
+    }
+
+    return null; // Open day — proceed to Make.com
+  } catch (err) {
+    console.error("Pre-flight check error:", err.message);
+    return null; // On error, don't block — let Make.com handle it
+  }
+}
 
 // ── Call Make.com BOOKING webhook and WAIT for JSON response
 async function triggerBooking(bookingParams, patientPhone, clinicId) {
@@ -1230,6 +1381,21 @@ async function processTextMessage(userPhone, userText, clinicId) {
     if (bookingParams) {
       // ── BOOKING FLOW
       console.log("Booking detected:", bookingParams);
+
+      // ── PRE-FLIGHT: Check if the requested day is closed (Phase M)
+      const preFlightResult = checkWorkingHoursPreFlight(bookingParams.time, clinicId);
+      if (preFlightResult) {
+        console.log("PRE-FLIGHT blocked booking:", preFlightResult);
+        const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify(preFlightResult)}]`;
+        const finalResponse = await callClaude(userPhone, resultMessage, clinicId);
+        const cleanFinal = stripAllTags(finalResponse);
+        if (cleanFinal) {
+          await sendWhatsApp(userPhone, cleanFinal, clinicId);
+          console.log(`Replied to ${userPhone} (pre-flight block): ${cleanFinal}`);
+        }
+        return;
+      }
+
       const makeResult = await triggerBooking(bookingParams, userPhone, clinicId);
       console.log("Calendar result:", makeResult);
 
@@ -1313,6 +1479,21 @@ async function processTextMessage(userPhone, userText, clinicId) {
     } else if (rescheduleParams) {
       // ── RESCHEDULE FLOW (with alternatives for failed reschedules)
       console.log("Reschedule detected:", rescheduleParams);
+
+      // ── PRE-FLIGHT: Check if the NEW time's day is closed (Phase M)
+      const preFlightResult = checkWorkingHoursPreFlight(rescheduleParams.new_time, clinicId);
+      if (preFlightResult) {
+        console.log("PRE-FLIGHT blocked reschedule:", preFlightResult);
+        const resultMessage = `[SYSTEM_RESULT: ${JSON.stringify({ status: "reschedule_failed_outside_hours" })}]`;
+        const finalResponse = await callClaude(userPhone, resultMessage, clinicId);
+        const cleanFinal = stripAllTags(finalResponse);
+        if (cleanFinal) {
+          await sendWhatsApp(userPhone, cleanFinal, clinicId);
+          console.log(`Replied to ${userPhone} (pre-flight block reschedule): ${cleanFinal}`);
+        }
+        return;
+      }
+
       const rescheduleResult = await triggerReschedule(rescheduleParams, userPhone, clinicId);
       console.log("Reschedule result:", rescheduleResult);
 
@@ -1375,6 +1556,7 @@ if (ragService) {
 }
 
 app.use("/api/clinics", createAdminRouter({ pool, loadClientsFromDB, ADMIN_SECRET, bedrockClient, ragService }));
+app.use("/api/bridge", createBridgeRouter({ pool, loadClientsFromDB, ADMIN_SECRET }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Sara v2 running on port ${PORT}`));
