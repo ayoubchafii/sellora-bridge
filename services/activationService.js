@@ -1,6 +1,8 @@
 // ══════════════════════════════════════════════════════════════
 // ── ACTIVATION SERVICE
 // ── Handles clinic activation + WhatsApp confirmation (B8)
+// ── Phase M: Removed working_hours_cal_id requirement
+// ──          (working hours now come from working_schedule column)
 // ══════════════════════════════════════════════════════════════
 
 /**
@@ -34,10 +36,11 @@ function createActivationHandler({ pool, loadClientsFromDB, sendWhatsApp, ADMIN_
       const clinic = result.rows[0];
 
       // ── Check required fields
+      // Phase M: working_hours_cal_id no longer required
+      //          (working hours managed via working_schedule JSONB column)
       const missing = [];
       if (!clinic.appointments_cal_id) missing.push("appointments_cal_id");
-      if (!clinic.working_hours_cal_id) missing.push("working_hours_cal_id");
-      if (!clinic.knowledge_base) missing.push("knowledge_base");
+      if (!clinic.knowledge_base && !clinic.use_rag) missing.push("knowledge_base");
 
       if (missing.length > 0) {
         return res.status(400).json({
