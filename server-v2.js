@@ -1254,7 +1254,7 @@ async function callClaude(userPhone, userMessage, clinicId) {
 
 // ── NOTE: Template messages (new_booking, appointment_cancelled, appointment_rescheduled)
 // are registered and approved in Meta. They will work when using a real WhatsApp Business
-// number (via 360dialog). Meta test numbers (+1 555-xxx) cannot send custom templates.
+// number (via Meta Cloud API). Meta test numbers (+1 555-xxx) cannot send custom templates.
 // The notifyClinicOwner() function has a fallback to regular text messages for test numbers.
 
 app.get("/webhook", (req, res) => {
